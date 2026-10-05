@@ -1,0 +1,30 @@
+{
+  "_comment_1": "这份文件跟随插件发布，所以只放【通用默认值】：不要写自己的用户名、token、本机路径。",
+  "_comment_2": "个人配置写这里：%USERPROFILE%\\.dsh\\github-sync\\config.json（插件首次加载会自动生成模板）。",
+  "_comment_3": "命名规则：DSH 插件的【文件夹】必须带 dsh- 前缀，仓库名默认就等于文件夹名。文件夹不合规会被列为阻断项，不会被静默改名。",
+  "_comment_4": "扫描目录默认就是【当前会话的工作区】，每个用户自动是自己的路径；workspaceRoot / pluginDirs 只在需要额外扫描别处时才填。",
+  "_comment_5": "github.topics：新仓库打的 GitHub topic，默认 dsh-plugin（联合投稿汇总页 https://github.com/topics/dsh-plugin）；写 [] 表示不打。",
+  "workspaceRoot": "",
+  "pluginDirs": [],
+  "github": {
+    "owner": "",
+    "tokenEnv": "GITHUB_TOKEN",
+    "accountType": "user",
+    "defaultVisibility": "private",
+    "apiBase": "https://api.github.com",
+    "verify": true,
+    "topics": [
+      "dsh-plugin"
+    ]
+  },
+  "git": {
+    "executable": "git",
+    "userName": "dsh-github-sync",
+    "userEmail": "dsh-github-sync@users.noreply.github.com",
+    "branch": "main",
+    "commitMessageTemplate": "sync {name} {version} ({stamp})"
+  },
+  "excludeNames": [],
+  "excludePatterns": [],
+  "plugins": {}
+}
