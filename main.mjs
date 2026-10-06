@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url'
 
 import { ensureUserConfig, loadConfig, USER_CONFIG, writeUserToken, clearUserToken } from './core/config.js'
 import { humanBytes, plan as buildPlan, execute, plan as planSync, resolveGit, scanRoots, writeStatus } from './core/sync.js'
-import { arm, cwdOf, gateText, isArmed, observeStep, TOOLS } from './core/prompt.js'
+import { arm, armMode, cwdOf, gateText, isArmed, isPushArmed, observeStep, TOOLS, wantsPush } from './core/prompt.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -176,6 +176,7 @@ function statusReport(cwd) {
 		}`,
 	)
 	lines.push(`  推送方式      每个插件一个独立仓库；默认增量提交、普通推送（不覆盖远端），可用 force 显式强推`)
+	lines.push(`  命名约定      dsh- 前缀，严重度 ${config.naming}${config.naming === 'block' ? '（不合规会阻断）' : config.naming === 'warn' ? '（不合规只警告）' : '（不检查）'}；只对 DSH 插件生效`)
 	for (const warning of config.warnings ?? []) {
 		lines.push('')
 		lines.push(`  ! ${warning}`)
@@ -191,12 +192,15 @@ function statusReport(cwd) {
 		for (const entry of discovery.entries) {
 			const { plugin, manifest } = entry
 			const state = entry.skipReason !== undefined ? '已关闭' : entry.blockers.length > 0 ? '有问题' : '可推送'
+			const kind = entry.plugin.kind === 'dsh-plugin' ? 'DSH 插件' : '普通项目'
 			lines.push(
 				`    [${state}] ${plugin.repo}  ←  ${plugin.relativeDir === '.' ? '.' : plugin.relativeDir}` +
+					`  [${kind}]` +
 					`  (${plugin.name}@${plugin.version}, ${manifest.mode === 'allowlist' ? '白名单' : '默认排除'}, ` +
 					`${manifest.files.length} 个文件 / ${humanBytes(manifest.totalBytes)})`,
 			)
-			for (const blocker of entry.blockers) lines.push(`        ! ${blocker}`)
+			for (const warning of entry.warnings ?? []) lines.push(`        ! ${warning}`)
+			for (const blocker of entry.blockers) lines.push(`        ✗ ${blocker}`)
 			if (entry.skipReason !== undefined) lines.push(`        - ${entry.skipReason}`)
 		}
 	}
@@ -227,7 +231,13 @@ function planReport({ cwd, only, verbose }) {
 	for (const entry of planned.entries) {
 		const { plugin, manifest } = entry
 		lines.push(`■ ${plugin.repo}  (${plugin.name}@${plugin.version})`)
-		lines.push(`  目录        ${plugin.dir}`)
+		lines.push(
+			`  目录        ${plugin.dir}${plugin.explicit === true ? '   （显式给出的路径，不在扫描结果里）' : ''}`,
+		)
+		lines.push(
+			`  判定        ${plugin.kind === 'dsh-plugin' ? 'DSH 插件' : '普通项目（非 DSH 插件）'}` +
+				`${plugin.fingerprint.length > 0 ? `  ← 依据：${plugin.fingerprint.join('、')}` : '  ← 没有 DSH 指纹'}`,
+		)
 		lines.push(`  仓库        ${entry.repository ?? '（未配置 github.owner）'}  [${entry.visibility}]`)
 		lines.push(`  仓库 topics ${entry.topics.length === 0 ? '（不打标签）' : entry.topics.join('、')}`)
 		lines.push(
@@ -248,7 +258,8 @@ function planReport({ cwd, only, verbose }) {
 			for (const item of manifest.secrets) lines.push(`      ${item.path}  —  ${item.kind}`)
 		}
 		if (entry.skipReason !== undefined) lines.push(`  状态        跳过 — ${entry.skipReason}`)
-		for (const blocker of entry.blockers) lines.push(`  ! ${blocker}`)
+		for (const blocker of entry.blockers) lines.push(`  ✗ 阻断：${blocker}`)
+		for (const warning of entry.warnings ?? []) lines.push(`  ! 警告：${warning}`)
 
 		if (verbose) {
 			lines.push('  文件：')
@@ -312,22 +323,42 @@ function overlay(cwd, request) {
 	const config = loadConfig()
 	const planned = planSync({ config, cwd, only: [] })
 	const ready = planned.entries.filter((entry) => entry.skipReason === undefined && entry.blockers.length === 0)
+	const mode = wantsPush(request) ? 'push' : 'investigate'
 	const lines = []
-	lines.push('`/git` 已触发 GitHub 同步。')
+	lines.push(mode === 'push' ? '`/git` 已触发 GitHub 同步 —— **推送轮**。' : '`/git` 已触发 GitHub 同步 —— **调查轮（只读）**。')
 	lines.push('')
-	if (request.trim() === '') {
-		lines.push('你没有在 /git 后面写具体要求，所以把下面这份现状当作待确认的意图，先问清楚再动手：')
+	if (mode === 'investigate') {
+		lines.push(
+			'这一轮不推送：`github_sync_push` 会被拒绝。把该查的查完、把要点讲清楚（要推哪些、推什么、有什么要决定的），',
+		)
+		lines.push('最后给出建议，并说明"要真正上传，请再发一条 /git 推送 …"。')
 	} else {
-		lines.push(`你的要求是：${request.trim()}`)
-		lines.push('')
-		lines.push('先按上面这句确认范围，再决定推送哪些插件：')
+		lines.push('这一轮允许上传。先试运行把要推的内容讲清楚，再推——只推下面这个要求覆盖到的范围。')
 	}
 	lines.push('')
-	lines.push(`- 可推送插件（${ready.length}/${planned.entries.length}）：${planned.entries.map((entry) => `${entry.plugin.repo}${entry.blockers.length > 0 || entry.skipReason !== undefined ? '（不可推送）' : ''}`).join('、') || '（无）'}`)
+	if (request.trim() === '') {
+		lines.push('你没有在 /git 后面写具体要求。')
+	} else {
+		lines.push(`你的要求是：${request.trim()}`)
+	}
+	lines.push('')
+	lines.push(`- 目标（${ready.length}/${planned.entries.length} 个可推送）：`)
+	for (const entry of planned.entries) {
+		const flag = entry.blockers.length > 0 || entry.skipReason !== undefined ? '（当前不可推送）' : ''
+		const kind = entry.plugin.kind === 'dsh-plugin' ? `DSH 插件，依据 ${entry.plugin.fingerprint.join('、')}` : '普通项目（非 DSH 插件）'
+		lines.push(`    - ${entry.plugin.repo}${flag} —— ${kind}`)
+		for (const warning of entry.warnings ?? []) lines.push(`        ! ${warning}`)
+		for (const blocker of entry.blockers) lines.push(`        ✗ ${blocker}`)
+	}
 	lines.push(`- GitHub 账号：${config.github.owner === '' ? '未配置，推不了' : config.github.owner}`)
 	lines.push(`- Token：${typeof config.github.token === 'string' && config.github.token !== '' ? '已有' : '缺失'}`)
+	lines.push(`- 命名约定严重度：${config.naming}（dsh- 前缀只是建议，默认 warn，不阻断）`)
 	lines.push('')
-	lines.push('按当前会话里的规则做：先 `github_sync_plan` 试运行并把要点讲清楚，得到确认后再 `github_sync_push`；本插件的推送工具只在这一轮里可用。')
+	lines.push(
+		mode === 'push'
+			? '按规则做：先 `github_sync_plan` 试运行并把要点讲清楚，然后 `github_sync_push`；本插件的推送工具只在这一轮里可用。'
+			: '按规则做：用 `github_sync_status` / `github_sync_plan` 把事实查清楚并报告；**本轮不要尝试推送**。',
+	)
 	return lines.join('\n')
 }
 
@@ -379,7 +410,17 @@ export function apply(ctx) {
 		() =>
 			ctx.tools.guard((execution) => {
 				if (execution?.name !== TOOLS.push) return undefined
-				if (isArmed(execution.agent)) return undefined
+				if (isPushArmed(execution.agent)) return undefined
+				// Two distinct refusals, because the way forward differs: an unarmed
+				// turn needs a `/git` at all, while an investigate turn needs the
+				// upload spelled out.
+				if (isArmed(execution.agent)) {
+					return (
+						`本轮是【调查轮】：/git 后面没有明确的推送意图，所以不允许上传。\n` +
+						'把该查的查完、把要点报告清楚，然后让人类发一条带推送意图的 /git（例如 `/git 推送 dsh-github-sync`）。\n' +
+						'现在不要上传，也不要为了"省一轮"而说服自己可以上传。'
+					)
+				}
 				return (
 					`${TOOLS.push} 只在人明确要求同步的那一轮里可用。\n` +
 					'这个会话没有收到 /git 指令，所以不允许上传任何东西。\n' +
@@ -393,14 +434,24 @@ export function apply(ctx) {
 	ctx.inject(['commands'], (commandCtx) => {
 		commandCtx.commands.register({
 			name: COMMAND,
-			description: 'GitHub 同步：按需注入说明并允许推送插件（平时不会注入任何东西）',
-			input: { hint: '[要推送哪个插件 / 或留空让我先问]' },
+			description: 'GitHub 同步：按需注入说明（带推送意图才允许上传；平时不会注入任何东西）',
+			input: { hint: '[推送 插件名 / 或留空，先只调查]' },
 			handler: ({ agent, rawInput }) => {
 				const cwd = resolveCwd(agent, loadConfig())
-				// The arm is the whole point: it unlocks the gated instructions and the
-				// push tool for exactly the turn this message starts.
+				// The arm is the whole point: it unlocks the gated instructions for
+				// exactly the turn this message starts, and records whether that turn
+				// may upload. `/git` alone means "go and look", which is often what a
+				// human wants — they get the findings first and ask for the upload with
+				// a second `/git`.
 				arm(agent, rawInput)
-				const text = statusReport(cwd)
+				const mode = armMode(agent)
+				const banner =
+					mode === 'push'
+						? `已进入【推送轮】：这一轮允许上传。要求：「${String(rawInput ?? '').trim()}」\n` +
+							'先试运行把要推的内容讲清楚，再推；只推要求覆盖到的范围。\n'
+						: '已进入【调查轮】：这一轮**只读**，推送工具会拒绝调用。\n' +
+							'要真正上传，请再发一条带推送意图的 /git（例如 `/git 推送 dsh-github-sync`）。\n'
+				const text = `${banner}\n${statusReport(cwd)}`
 				// Build the injected turn through an identified message. A bare
 				// `{ role, content, source }` object looks right in memory but has no
 				// `id`, and the session journal records `user/message` verbatim: the
@@ -417,6 +468,7 @@ export function apply(ctx) {
 				writeStatus({
 					version: VERSION,
 					armed: true,
+					mode,
 					cwd,
 					command: `/${COMMAND}`,
 					plugins: buildPlan({ config: loadConfig(), cwd, only: [] }).entries.map((entry) => ({
@@ -454,7 +506,8 @@ export function apply(ctx) {
 				plugins: {
 					type: 'array',
 					items: { type: 'string' },
-					description: '只处理这些插件（仓库名 / 目录名 / 包名都认）。省略表示全部。'
+					description:
+						'要处理哪些目标：写扫描到的插件名（仓库名 / 目录名 / 包名都认），也可以直接写一个【目录路径】（相对或绝对），用来处理扫描结果之外的目录（例如非 DSH 的项目）。省略表示扫描到的全部。'
 				},
 				verbose: { type: 'boolean', description: '列出每一个被排除的文件，而不只是示例。' }
 			}
@@ -479,7 +532,8 @@ export function apply(ctx) {
 				plugins: {
 					type: 'array',
 					items: { type: 'string' },
-					description: '只推送这些插件。省略表示推送全部可推送的插件。'
+					description:
+						'要发布哪些目标：写扫描到的插件名（如 dsh-sticker），也可以直接写一个【目录路径】（相对或绝对），用来发布扫描结果之外的目录（例如非 DSH 的项目）。省略表示扫描到的全部。'
 				},
 				commonMessage: { type: 'string', description: '覆盖本次提交说明（默认用配置里的模板，含插件名与版本）。' },
 				createRepos: { type: 'boolean', description: '仓库不存在时自动创建，默认 true。' },

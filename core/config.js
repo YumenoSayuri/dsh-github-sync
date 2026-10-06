@@ -28,14 +28,47 @@ export const BUNDLE_CONFIG = join(HERE, 'sync.config.json')
 /** Diagnostics the plugin rewrites on every activation and push. */
 export const STATUS_FILE = join(HERE, 'sync.status.json')
 
+/**
+ * The harness's own home directory (`~/.dsh`).
+ *
+ * Exported because it is a hard safety boundary, not just a location: it holds
+ * this plugin's token, every session transcript, and the publish mirrors. A
+ * publish target that contains it — or sits inside it — must be refused, or a
+ * mistyped path would upload a credential.
+ */
+export const DSH_HOME = join(homedir(), '.dsh')
+
 /** Home-level directory holding the secret-bearing user file. */
-export const USER_DIR = join(homedir(), '.dsh', 'github-sync')
+export const USER_DIR = join(DSH_HOME, 'github-sync')
 /** The one file a human edits to hand the plugin a token. */
 export const USER_CONFIG = join(USER_DIR, 'config.json')
 /** One persistent clone per plugin: where the published commit history lives. */
 export const MIRRORS_DIR = join(USER_DIR, 'mirrors')
 /** Cached license bodies, so publishing never depends on the licenses endpoint twice. */
 export const LICENSES_DIR = join(USER_DIR, 'licenses')
+
+/** Accepted severities for the dsh- folder convention. */
+export const NAMING_SEVERITIES = ['block', 'warn', 'off']
+
+/**
+ * Normalize the naming severity.
+ *
+ * The convention is about DSH plugins, and breaking it is cosmetic rather than
+ * destructive — the repository simply reads as an outsider — so the default is a
+ * warning. `block` is there for someone who wants the hard guarantee that no
+ * misnamed repository is ever published.
+ *
+ * @param {unknown} value - configured `naming`.
+ * @returns {'block' | 'warn' | 'off'} the effective severity.
+ */
+function namingOf(value) {
+	if (value === undefined || value === null || value === '') return 'warn'
+	const text = String(value).trim().toLowerCase()
+	if (!NAMING_SEVERITIES.includes(text)) {
+		throw new Error(`配置字段 naming 只能是 ${NAMING_SEVERITIES.join(' / ')}，收到的是 ${JSON.stringify(value)}`)
+	}
+	return text
+}
 
 /**
  * Default ceiling for one published file, in bytes.
@@ -127,6 +160,7 @@ const TOP_LEVEL_KEYS = new Set([
 	'mirrorsDir',
 	'licensesDir',
 	'maxFileBytes',
+	'naming',
 	'github',
 	'git',
 	'excludeNames',
@@ -417,6 +451,7 @@ export function loadConfig() {
 		workspaceRoot: typeof merged.workspaceRoot === 'string' && merged.workspaceRoot.trim() !== '' ? merged.workspaceRoot.trim() : undefined,
 		pluginDirs: stringList(merged.pluginDirs, 'pluginDirs'),
 		maxFileBytes: maxFileBytesOf(merged.maxFileBytes),
+		naming: namingOf(merged.naming),
 		mirrorsDir:
 			typeof merged.mirrorsDir === 'string' && merged.mirrorsDir.trim() !== '' ? merged.mirrorsDir.trim() : MIRRORS_DIR,
 		licensesDir:
@@ -560,6 +595,8 @@ export function ensureUserConfig() {
 		_comment_6: 'github.copyright：自动生成的版权行署名；留空则用 github.owner。',
 		_comment_7: 'git.userEmail / git.userName 是**提交署名**。两者都留空，就用 token 所属账号派生：名字取账号显示名，邮箱用 <你的ID>+<用户名>@users.noreply.github.com —— 能关联到你的头像，又不公开真实邮箱。',
 		_comment_8: '想署自己的邮箱就填 git.userEmail，但该邮箱必须**先在 GitHub 账号里验证过**；否则提交在 GitHub 上会显示成一个无头像、点不开的陌生人。另外注意：写进提交的邮箱是公开的。',
+		_comment_9: 'naming：dsh- 前缀约定的严重度。warn（默认）只警告、仍可发布；block 硬拦；off 不检查。这条约定只对【DSH 插件】生效（依据 package.json 的 dsh.bundle / dsh.client，或关键词含 dsh）。',
+		naming: '',
 		github: {
 			owner: '',
 			token: '',

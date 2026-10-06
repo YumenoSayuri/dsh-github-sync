@@ -10,10 +10,10 @@
  */
 
 import { existsSync, writeFileSync } from 'node:fs'
-import { delimiter, join } from 'node:path'
+import { basename, delimiter, isAbsolute, join, resolve, sep } from 'node:path'
 
-import { STATUS_FILE, USER_CONFIG } from './config.js'
-import { discoverPlugins } from './discover.js'
+import { DSH_HOME, STATUS_FILE, USER_CONFIG } from './config.js'
+import { discoverPlugins, explicitTarget } from './discover.js'
 import { createRepository, describeRepository, setTopics, whoAmI } from './github.js'
 import { publish } from './git.js'
 import { buildLicenseEntry, licenseFileOf } from './license.js'
@@ -115,6 +115,43 @@ export function resolveGit(executable) {
 }
 
 /**
+ * Find configuration for an explicitly requested target.
+ *
+ * An explicit target has no single obvious config key — it was named by path —
+ * so several spellings are accepted, in order of specificity. Without this, a
+ * human who wanted a different repository name for a named directory would have
+ * to guess the exact string someone else would type months later.
+ *
+ * @param {ResolvedConfig} config - the resolved configuration.
+ * @param {string} requested - the value as it was requested.
+ * @param {string} absolute - the resolved absolute directory.
+ * @returns {object} the entry, or an empty object.
+ */
+function targetEntry(config, requested, absolute) {
+	const table = config.plugins ?? {}
+	for (const key of [requested, absolute, basename(absolute)]) {
+		const entry = table[key]
+		if (entry !== undefined && entry !== null && typeof entry === 'object') return entry
+	}
+	return {}
+}
+
+/**
+ * Whether a request names a location rather than a plugin.
+ *
+ * Deliberately generous: a directory that exists is what matters, and the check
+ * for that happens afterwards. An absolute path, or anything carrying a path
+ * separator, is read as a location; a bare word is read as a name first, and only
+ * becomes a location if a directory of that name sits under the workspace.
+ *
+ * @param {string} value - one `only` entry.
+ * @returns {boolean} true when the value should be resolved as a path.
+ */
+function looksLikePath(value) {
+	return isAbsolute(value) || value.includes('/') || value.includes(sep)
+}
+
+/**
  * Build the sync plan: one entry per discovered plugin, with its manifest and
  * every problem that would stop it, but no side effects at all.
  *
@@ -146,13 +183,40 @@ export function plan({ config, cwd, only }) {
 		)
 		if (matches) selected.push(plugin)
 	}
-	if (wanted.length > 0 && selected.length === 0) {
-		problems.push(`没有匹配的插件：${wanted.join('、')}（可用名称见 github_sync_status 的插件清单）`)
+
+	// Anything the scan did not recognise is still publishable when it names a
+	// directory: the scan lists what happens to be around, and the permission to
+	// publish comes from the human's request, not from the scan's heuristics. A
+	// session already working inside a project is often the best-informed party
+	// about what should ship, and a `package.json` marker has nothing to do with
+	// whether that project may be published.
+	//
+	// A bare word is tried as a name first and as a directory second, so both
+	// `/git 推送 my-app` and `/git 推送 ../my-app` work without the human having to
+	// know which mechanism is which.
+	for (const value of wanted) {
+		const known = discovery.plugins.some((plugin) =>
+			[plugin.key, plugin.repo, plugin.dirName, plugin.name, plugin.configKey].includes(value),
+		)
+		if (known) continue
+		const candidate = resolve(cwd ?? process.cwd(), value)
+		if (!looksLikePath(value) && !existsSync(candidate)) {
+			problems.push(`未知插件：${value}（也可以直接给出目录路径，用来发布扫描结果之外的目录）`)
+			continue
+		}
+		const resolved = explicitTarget({
+			dir: candidate,
+			// Configuration may address an explicit target by whatever is stable:
+			// the string that was requested, the absolute path, or the folder name.
+			entry: targetEntry(config, value, candidate),
+			dshHome: DSH_HOME,
+		})
+		if (resolved.target !== undefined) {
+			selected.push(resolved.target)
+			continue
+		}
+		problems.push(resolved.problem)
 	}
-	const unmatched = wanted.filter(
-		(value) => !discovery.plugins.some((plugin) => [plugin.key, plugin.repo, plugin.dirName, plugin.name, plugin.configKey].includes(value)),
-	)
-	for (const value of unmatched) problems.push(`未知插件：${value}`)
 
 	/** @type {PlanEntry[]} */
 	const entries = []
@@ -169,7 +233,15 @@ export function plan({ config, cwd, only }) {
 			manifest,
 			repository: config.github.owner === '' ? undefined : `${config.github.owner}/${plugin.repo}`,
 			visibility: plugin.visibility ?? config.visibility,
-			topics: Array.isArray(plugin.entry?.topics) ? plugin.entry.topics : config.github.topics,
+			// The dsh-plugin topic is how the ecosystem lists DSH plugins, so it is
+			// the default only for things that are DSH plugins. A plain project gets
+			// no topic — unless one is asked for. An explicitly empty list stays empty:
+			// `topics: []` in a plugin entry is how a human says "do not tag this".
+			topics: Array.isArray(plugin.entry?.topics)
+				? plugin.entry.topics
+				: plugin.kind === 'dsh-plugin'
+					? config.github.topics
+					: [],
 			mirror: mirrorFor(config, plugin.repo),
 			// A license already in the plugin wins; otherwise a configured one is
 			// generated into the same commit. Planning states the intent without
@@ -181,18 +253,34 @@ export function plan({ config, cwd, only }) {
 			skipReason: undefined,
 		}
 		if (!plugin.enabled) entry.skipReason = '在 sync.config.json 里被 enabled: false 关掉了'
-		if (config.github.owner === '') entry.blockers.push('没有配置 GitHub 账号：在 %USERPROFILE%\\.dsh\\github-sync\\config.json 里填 github.owner')
-		// DSH convention: the plugin folder carries the dsh- prefix, and the
-		// repository takes its name from that folder. A folder that breaks the
-		// convention would publish a repository that no longer reads as a DSH
-		// plugin, so it is refused rather than renamed silently. An explicit
-		// `plugins.<name>.repo` counts as a deliberate exception and is left alone.
-		if (plugin.folderPrefixOk === false && plugin.repoFrom === 'folder-name') {
-			entry.blockers.push(
-				`插件文件夹名不符合 DSH 约定：目录「${plugin.dirName}」缺少 dsh- 前缀。` +
-					`把文件夹改名为「${plugin.suggestedName}」后，仓库名会自动变成该名字；` +
-					`若这是有意的例外，请在 sync.config.json 里显式写 plugins「${plugin.configKey ?? plugin.dirName}」的 repo。`,
+		if (plugin.explicit === true) {
+			// Never a surprise: an explicitly named directory is reported as such, and
+			// a scan root is called out because publishing one means publishing
+			// everything below it as a single repository.
+			entry.warnings.push(
+				`「${plugin.dir}」是显式给出的目录，不在扫描结果里；按${plugin.kind === 'dsh-plugin' ? ' DSH 插件' : '普通项目'}处理。`,
 			)
+			if (roots.some((root) => resolve(root) === plugin.dir)) {
+				entry.warnings.push(
+					`这个目录就是扫描根目录本身（${plugin.dir}），会把该目录下的所有内容当成一个仓库发布。如果不是你想要的，请给出更具体的子目录。`,
+				)
+			}
+		}
+		if (config.github.owner === '') entry.blockers.push('没有配置 GitHub 账号：在 %USERPROFILE%\\.dsh\\github-sync\\config.json 里填 github.owner')
+		// The dsh- convention is about DSH plugins, so it is applied to the targets
+		// that actually are DSH plugins — the tool reports the fingerprint it used.
+		// Severity is configuration: a hard refusal is right for someone curating a
+		// consistently named set, while a warning is right for a plugin developed
+		// under a working name, since the harm is cosmetic (the repository reads as
+		// an outsider) and nothing was renamed behind anyone's back either way.
+		if (plugin.kind === 'dsh-plugin' && plugin.folderPrefixOk === false && plugin.repoFrom === 'folder-name') {
+			const advice = `${plugin.dirName} 是 DSH 插件（依据：${plugin.fingerprint.join('、')}），但文件夹名缺少 dsh- 前缀，所以仓库名会是「${plugin.repo}」，在 dsh-plugin 汇总里不太像同类。`
+			const how =
+				`改文件夹名为「${plugin.suggestedName}」后仓库名会自动跟着变（注意：改名会打断 profile 里按路径的 link: 依赖，需要重新安装/链接）；` +
+				`或者显式写 plugins「${plugin.configKey ?? plugin.dirName}」的 repo 来表达"这是有意的例外"。`
+			const severity = namingSeverity(config)
+			if (severity === 'block') entry.blockers.push(`${advice}${how}`)
+			else if (severity === 'warn') entry.warnings.push(`${advice}${how}（当前 naming 不为 block，所以只警告、不阻断。）`)
 		}
 		if (manifest.files.length === 0) entry.blockers.push('干净副本为空：检查该插件的 include 白名单或排除规则')
 		if (manifest.notes.length > 0) entry.blockers.push(...manifest.notes)
@@ -200,6 +288,21 @@ export function plan({ config, cwd, only }) {
 	}
 
 	return { roots: discovery.roots, entries, problems, pluginCount: discovery.plugins.length }
+}
+
+/**
+ * How strictly the `dsh-` folder convention is enforced.
+ *
+ * `warn` is the default: the convention exists so a published repository reads as
+ * a DSH plugin, which is worth saying out loud but is not worth refusing to
+ * publish over. `block` restores the hard refusal for someone curating a
+ * consistently named set.
+ *
+ * @param {ResolvedConfig} config - the resolved configuration.
+ * @returns {'block' | 'warn' | 'off'} the effective severity.
+ */
+function namingSeverity(config) {
+	return config.naming ?? 'warn'
 }
 
 /**

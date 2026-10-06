@@ -35,12 +35,37 @@ export const TOOLS = {
 const ARM_TTL_MS = 30 * 60 * 1000
 
 /**
+ * Words that ask for an upload.
+ *
+ * `/git` on its own is an invitation to look, not to publish: exploring what
+ * would ship is useful on its own, and a human who has just been shown the plan
+ * can ask for the upload in a second `/git`. Requiring an explicit verb keeps the
+ * original rule intact — nothing is ever uploaded on the tool's own initiative —
+ * without making every push cost two turns.
+ */
+const PUSH_INTENT = /(推送|上传|推上去|推到|推一下|发布|同步|push|upload|publish|sync)/i
+
+/** Words that hold an upload back even when the same sentence asks for one. */
+const HOLD_BACK = /(先别|别推送|不要推送|暂不|先不|别上传|不要上传|先看看|只看|别推|don't push|do not push|hold off)/i
+
+/**
+ * Whether a `/git` request asks for an upload, rather than only a look.
+ *
+ * @param {string | undefined} request - the human's text after `/git`.
+ * @returns {boolean} true when the request carries an explicit upload intent.
+ */
+export function wantsPush(request) {
+	const text = String(request ?? '')
+	return PUSH_INTENT.test(text) && !HOLD_BACK.test(text)
+}
+
+/**
  * @typedef {object} Arm
- * @property {number} at - when the arm was created.
  * @property {number} at - when the arm was created.
  * @property {number | undefined} turn - the turn the arm is currently grazing.
  * @property {number | undefined} origin - the turn the instructions belong to.
  * @property {string} request - the human's text after `/git`, possibly empty.
+ * @property {'push' | 'investigate'} mode - whether this turn may upload.
  */
 
 /** @type {WeakMap<object, Arm>} */
@@ -53,7 +78,14 @@ const arms = new WeakMap()
  * @param {string} request - the human's text after `/git`.
  */
 export function arm(agent, request) {
-	arms.set(agent, { at: Date.now(), turn: undefined, origin: undefined, request: String(request ?? '') })
+	const text = String(request ?? '')
+	arms.set(agent, {
+		at: Date.now(),
+		turn: undefined,
+		origin: undefined,
+		request: text,
+		mode: wantsPush(text) ? 'push' : 'investigate',
+	})
 }
 
 /**
@@ -75,6 +107,30 @@ export function isArmed(agent) {
 		return false
 	}
 	return true
+}
+
+/**
+ * Whether this armed turn may actually upload.
+ *
+ * Investigate turns are armed too — they may read the configuration, the plan,
+ * and the file lists — but the push tool refuses, and says how to proceed.
+ *
+ * @param {object} agent - the agent attempting the call.
+ * @returns {boolean} true when the human's request carried an upload intent.
+ */
+export function isPushArmed(agent) {
+	if (!isArmed(agent)) return false
+	return arms.get(agent)?.mode === 'push'
+}
+
+/**
+ * The mode of the current arm, for the instructions and for diagnostics.
+ *
+ * @param {object} agent - the armed agent.
+ * @returns {'push' | 'investigate' | undefined} the mode, when armed.
+ */
+export function armMode(agent) {
+	return isArmed(agent) ? arms.get(agent)?.mode : undefined
 }
 
 /**
@@ -168,18 +224,62 @@ export function gateText(context) {
 	if (agent === undefined || agent === null) return ''
 	if (!gateOpen(arms.get(agent))) return ''
 	const info = inventory(agent)
+	const current = arms.get(agent)
+	const phase =
+		current?.mode === 'push'
+			? [
+					'## This turn: an upload is authorized',
+					'',
+					`The human asked for an upload: "${current.request.trim()}". Read the plan first and show its substance; then upload only what the request covers.`,
+				]
+			: [
+					'## This turn: investigate only — the push tool will refuse',
+					'',
+					current !== undefined && current.request.trim() !== ''
+						? `The human wrote "${current.request.trim()}", which does not ask for an upload, so this turn is for finding out.`
+						: 'The human sent `/git` with no further text, so this turn is for finding out.',
+					'',
+					`Look everything up: \`${TOOLS.status}\`, \`${TOOLS.plan}\` (with \`verbose\` when the exclusion list matters), and the plugin directories themselves. Then report what would be published, what would not, and anything that needs a decision.`,
+					'',
+					`**To upload, the human sends \`/git 推送 …\` in their next message.** Do not treat this turn as a request to upload, and do not ask for a second confirmation you could have avoided: if the answer is ready, say what you found and end with the one line they should send.`,
+				]
 	return [
 		'# GitHub sync — explicitly requested by the human',
 		'',
 		'The human typed `/git`, which is the only way this capability becomes available. It lasts for this one turn.',
 		'',
+		...phase,
+		'',
 		'## The rule that matters',
 		'',
-		'- **Never upload on your own initiative.** One session of `/git` authorizes nothing beyond what the human asked for in this turn.',
-		'- **A new session cannot upload.** Without `/git` in that session, the push tool refuses every call. If a human asks you to upload and the tool refuses, tell them to send `/git` first — do not work around it.',
+		'- **Never upload on your own initiative.** Only a turn whose request carried an upload intent may push; every other turn is read-only, and the push tool refuses.',
+		'- **A new session cannot upload.** Without `/git` in that session, the push tool refuses every call. If a human asks you to upload and the tool refuses, tell them to send `/git 推送 …` — do not work around it.',
 		'- **Treat the human\'s request as the scope.** "Push the sticker plugin" means that plugin. "Push everything" means everything. When the request is ambiguous about *which* plugins or *which* repository, ask before pushing.',
 		'- **Read before you write.** `github_sync_plan` is a dry run: it reports exactly which files would ship, how many bytes, and what was excluded and why. Run it, show the human the substance, and only then push.',
 		'- **Report what actually happened.** Quote real file counts, commit ids, and repository URLs from the tool results. If a plugin failed, say so and say why; never describe a failure as a success.',
+		'',
+		'## 自适应：先判断这是什么，再套对应的规则',
+		'',
+		'不是所有目录都是 DSH 插件，所以不要一律套同一条规则。**工具已经把判定结果报给你了**：每个条目标注它是不是 DSH 插件（指纹 = `package.json` 的 `dsh.bundle` / `dsh.client`，或关键词含 `dsh`；也包括 `cordis.patch.yml`），以及它的 `kind`。据此分别处理：',
+		'',
+		'| 判定 | 命名 | topic | 协议 |',
+		'|---|---|---|---|',
+		'| DSH 插件 | 文件夹**建议**带 `dsh-` 前缀（仓库名默认取文件夹名）。不合规默认只**警告**，除非配置 `naming: "block"` | 默认打 `dsh-plugin` | 缺失且配了 `github.license` 才生成 |',
+		'| 普通项目（显式 `targets` 里声明的目录） | **不适用**，不要建议改名 | 默认不打 | 缺失且该 target 配了 `license` 才生成 |',
+		'',
+		'你**不需要**自己去猜指纹——报给你的分类就是判定结果。但你需要**自己判断该怎么做**：不合规要不要改名（改名会打断 profile 的 `link:` 依赖）、要不要加协议、要不要打 topic，都应当在报告里给出你的建议和代价，让人来定。',
+		'',
+		'注意：`dsh-` 前缀只是**建议的约定**，不是"必须"。真正的硬性要求只有一条：**不要静默替人改名**，也不要静默替人决定协议。',
+		'',
+		'## 范围不等于扫描结果',
+		'',
+		'扫描器只负责列出"工作区里看起来像 DSH 插件的东西"，它**不是**发布权限的来源——发布权限来自人类的要求。所以：',
+		'',
+		`- \`${TOOLS.plan}\` 与 \`${TOOLS.push}\` 的 \`plugins\` 参数**也接受目录路径**（相对或绝对）。扫描没认出来的目录照样可以发布，只要路径存在；会话自己就在某个项目的开发环境里时，直接给出那个目录即可。`,
+		'- 目标是不是 DSH 插件由指纹判定并报给你；不是的话就不套 `dsh-` 前缀与 `dsh-plugin` topic，其余流程完全一样（干净副本、密钥扫描、单文件上限、提交、普通推送）。',
+		'- 报告义务不因目标来源而改变：**哪些文件会发布、多少字节、排除了什么**，一律照报。',
+		'',
+		'唯一会拒绝的目标是与 DSH 自己的目录（`~/.dsh`，存着 token、会话记录、发布镜像）相重叠的路径——那是为了不让密钥被推上去。',
 		'',
 		'## Tools',
 		'',
