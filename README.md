@@ -60,7 +60,8 @@
 ### 1. 填写 GitHub 账号与 Token（只需一次）
 
 编辑用户配置文件（不在任何仓库里）：
-`C:\Users\Lenovo\.dsh\github-sync\config.json`
+`%USERPROFILE%\.dsh\github-sync\config.json`
+（插件首次加载会自动生成带注释的模板，所以通常直接打开改就行。）
 
 ```json
 {
