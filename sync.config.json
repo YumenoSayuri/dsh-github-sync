@@ -3,10 +3,15 @@
   "_comment_2": "个人配置写这里：%USERPROFILE%\\.dsh\\github-sync\\config.json（插件首次加载会自动生成模板）。",
   "_comment_3": "命名规则：DSH 插件的【文件夹】必须带 dsh- 前缀，仓库名默认就等于文件夹名。文件夹不合规会被列为阻断项，不会被静默改名。",
   "_comment_4": "扫描目录默认就是【当前会话的工作区】，每个用户自动是自己的路径；workspaceRoot / pluginDirs 只在需要额外扫描别处时才填。",
-  "_comment_5": "github.topics：新仓库打的 GitHub topic，默认 dsh-plugin（联合投稿汇总页 https://github.com/topics/dsh-plugin）；写 [] 表示不打。",
+  "_comment_5": "mirrorsDir：每个插件一个常驻 clone，发布的提交历史保存在这里；删掉它即可让下次重新对齐远端。licensesDir 缓存协议正文。留空用默认位置。",
   "workspaceRoot": "",
   "pluginDirs": [],
+  "mirrorsDir": "",
+  "licensesDir": "",
   "github": {
+    "_comment_topics": "新仓库打的 GitHub topic；默认 dsh-plugin，联合投稿汇总页 https://github.com/topics/dsh-plugin；写 [] 表示不打。",
+    "_comment_license": "缺失 LICENSE 时自动生成的协议标识：MIT / Apache-2.0 / BSD-3-Clause / MPL-2.0 / GPL-3.0 / Unlicense… 写空字符串表示不生成、只在状态里告警。正文取自 GitHub 官方接口，不自己编。",
+    "_comment_copyright": "生成的版权行署名；留空则用 github.owner。",
     "owner": "",
     "tokenEnv": "GITHUB_TOKEN",
     "accountType": "user",
@@ -15,7 +20,9 @@
     "verify": true,
     "topics": [
       "dsh-plugin"
-    ]
+    ],
+    "license": "",
+    "copyright": ""
   },
   "git": {
     "executable": "git",

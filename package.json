@@ -9,13 +9,13 @@
     "description": "把插件干净地同步到 GitHub。只有你在对话里 /git 时才注入说明并允许推送，插件自己从不自动上传。"
   },
   "exports": {
-    ".": "./plugin.mjs",
+    ".": "./main.mjs",
     "./package.json": "./package.json"
   },
   "icon": "./icon.svg",
   "files": [
-    "plugin.mjs",
-    "internal",
+    "main.mjs",
+    "core",
     "cordis.patch.yml",
     "sync.config.json",
     "sync.status.json",

@@ -3,8 +3,10 @@
  *
  * The plan is always computed before anything is published, and it is what both
  * the preview tool and the push tool render, so what a human approves is exactly
- * what runs. Every step is idempotent — publishing always produces a fresh
- * single-commit snapshot — so a retry after a partial failure is safe.
+ * what runs. Publishing is idempotent in the way git is: the same manifest
+ * produces no commit at all, and the commit that does happen always contains
+ * exactly the clean copy — never a build artifact, a cache, or a runtime state
+ * file, including one that an earlier publish had committed.
  */
 
 import { existsSync, writeFileSync } from 'node:fs'
@@ -14,10 +16,33 @@ import { STATUS_FILE, USER_CONFIG } from './config.js'
 import { discoverPlugins } from './discover.js'
 import { createRepository, describeRepository, setTopics, whoAmI } from './github.js'
 import { publish } from './git.js'
+import { buildLicenseEntry, licenseFileOf } from './license.js'
 import { buildManifest } from './manifest.js'
 
 /** Terminal states a plugin's sync can end in. */
 export const OUTCOMES = ['pushed', 'unchanged', 'created+pushed', 'planned', 'skipped', 'failed']
+
+/**
+ * Where one plugin's persistent mirror lives.
+ *
+ * @param {ResolvedConfig} config - the resolved configuration.
+ * @param {string} repo - the repository (and mirror) name.
+ * @returns {string} absolute mirror path.
+ */
+export function mirrorFor(config, repo) {
+	return join(config.mirrorsDir, repo)
+}
+
+/**
+ * The credential helper's home: beside the mirrors, never inside one, so it can
+ * never be staged into a commit.
+ *
+ * @param {ResolvedConfig} config - the resolved configuration.
+ * @returns {string} absolute helper path.
+ */
+export function helperFor(config) {
+	return join(config.mirrorsDir, '.credential-helper.mjs')
+}
 
 /**
  * The directories searched for plugins, in priority order.
@@ -144,6 +169,12 @@ export function plan({ config, cwd, only }) {
 			repository: config.github.owner === '' ? undefined : `${config.github.owner}/${plugin.repo}`,
 			visibility: plugin.visibility ?? config.visibility,
 			topics: Array.isArray(plugin.entry?.topics) ? plugin.entry.topics : config.github.topics,
+			mirror: mirrorFor(config, plugin.repo),
+			// A license already in the plugin wins; otherwise a configured one is
+			// generated into the same commit. Planning states the intent without
+			// fetching anything, so a preview stays offline.
+			licenseFile: licenseFileOf(manifest),
+			licenseToGenerate: licenseWanted(config, plugin),
 			blockers: [],
 			skipReason: undefined,
 		}
@@ -170,6 +201,23 @@ export function plan({ config, cwd, only }) {
 }
 
 /**
+ * Resolve the license a plugin wants generated: an explicit per-plugin value
+ * first, then the global one. `null` or an empty string anywhere means "do not
+ * generate", which is the default — the plugin does not pick legal terms on a
+ * human's behalf.
+ *
+ * @param {ResolvedConfig} config - the resolved configuration.
+ * @param {DiscoveredPlugin} plugin - the plugin being published.
+ * @returns {string | undefined} the license key to generate, when one is wanted.
+ */
+function licenseWanted(config, plugin) {
+	const perPlugin = plugin.entry?.license
+	if (perPlugin === null || perPlugin === '') return undefined
+	if (typeof perPlugin === 'string' && perPlugin.trim() !== '') return perPlugin.trim()
+	return config.github.license ?? undefined
+}
+
+/**
  * Publish every planned entry.
  *
  * @param {object} options - push inputs.
@@ -178,9 +226,10 @@ export function plan({ config, cwd, only }) {
  * @param {boolean} [options.dryRun] - stage and commit without pushing.
  * @param {boolean} [options.createRepos] - create missing repositories through the API.
  * @param {boolean} [options.verify] - check each repository through the API first.
+ * @param {boolean} [options.force] - replace the remote branch instead of fast-forwarding.
  * @returns {Promise<{ results: PushResult[], warnings: string[], identity?: { login: string, type: string } }>} the outcome.
  */
-export async function execute({ config, plan: planValue, dryRun = false, createRepos = true, verify = true }) {
+export async function execute({ config, plan: planValue, dryRun = false, createRepos = true, verify = true, force = false }) {
 	const warnings = []
 	const gitProbe = resolveGit(config.git.executable)
 	if (!gitProbe.ok) throw new Error(gitProbe.hint)
@@ -258,9 +307,35 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 				}
 			}
 
+			// The generated license joins the same commit as the code, so a single
+			// snapshot still describes the whole published state.
+			if (entry.licenseToGenerate !== undefined && entry.licenseFile === undefined) {
+				try {
+					const generated = await buildLicenseEntry({
+						apiBase: config.github.apiBase,
+						token,
+						key: entry.licenseToGenerate,
+						copyright: config.github.copyright,
+						cacheDir: config.licensesDir,
+					})
+					manifest.extra = [...(manifest.extra ?? []), generated]
+					record.generatedLicense = generated.license
+				} catch (error) {
+					throw new Error(`${error.message}\n（或把 github.license 设为空字符串以关闭自动生成）`)
+				}
+			} else if (entry.licenseFile !== undefined) {
+				record.licenseFile = entry.licenseFile
+			} else {
+				warnings.push(
+					`${plugin.repo} 既没有 LICENSE 文件，也没有配置要生成的开源协议。公开仓库最好有一个：把 github.license 设为 MIT / Apache-2.0 / MPL-2.0 等即可自动生成。`,
+				)
+			}
+
 			const published = await publish({
 				manifest,
 				repository: entry.repository ?? 'dry-run/local',
+				mirror: entry.mirror,
+				helperPath: helperFor(config),
 				branch: config.git.branch,
 				commitMessage: commitMessage(config.git.commitMessageTemplate, plugin),
 				git: config.git.executable,
@@ -269,15 +344,29 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 				token,
 				tokenFile: USER_CONFIG,
 				dryRun,
+				force,
 			})
 			record.sha = published.sha
 			record.files = published.files
-			if (dryRun) {
+			record.mirror = published.mirror
+			record.historyDepth = published.historyDepth
+			record.changed = published.changed
+			record.unchanged = published.unchanged
+
+			if (published.unchanged) {
+				record.outcome = 'unchanged'
+				record.detail.push('干净副本与远端已经一致，没有产生提交，也没有推送。')
+			} else if (dryRun) {
 				record.outcome = 'planned'
-				record.detail.push(`已试运行：新建 ${published.files} 个文件、一次提交 ${published.sha.slice(0, 10)}，没有推送`)
+				record.detail.push(`试运行：将提交 ${published.changed.length} 处变更（当前远端历史 ${published.historyDepth} 个提交），没有提交也没有推送`)
+				record.detail.push(...describeChanges(published.changed))
 			} else {
 				if (record.outcome !== 'created+pushed') record.outcome = 'pushed'
-				record.detail.push(`已推送到 https://github.com/${entry.repository}（分支 ${config.git.branch}，提交 ${published.sha.slice(0, 10)}）`)
+				record.detail.push(
+					`已推送 ${published.changed.length} 处变更到 https://github.com/${entry.repository}` +
+						`（分支 ${config.git.branch}，提交 ${published.sha.slice(0, 10)}，历史 ${published.historyDepth} 个提交）`,
+				)
+				record.detail.push(...describeChanges(published.changed))
 
 				// Topics are applied after the code so a topics failure can never cost
 				// the upload. The repository exists by now, so the dedicated endpoint
@@ -306,6 +395,27 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 	}
 
 	return { results, warnings, identity }
+}
+
+/**
+ * Render git's porcelain status codes as a short, honest change summary.
+ *
+ * @param {{ code: string, path: string }[]} changed - parsed `git status --porcelain`.
+ * @param {number} [limit] - how many entries to spell out.
+ * @returns {string[]} one line per change, plus a count when truncated.
+ */
+function describeChanges(changed, limit = 12) {
+	const label = (code) => {
+		if (code === 'A' || code === '??') return '新增'
+		if (code === 'M') return '修改'
+		if (code === 'D') return '删除'
+		if (code === 'R') return '改名'
+		if (code === 'T') return '类型变更'
+		return code
+	}
+	const lines = changed.slice(0, limit).map((item) => `  ${label(item.code)} ${item.path}`)
+	if (changed.length > limit) lines.push(`  …… 另有 ${changed.length - limit} 处`)
+	return lines
 }
 
 /**

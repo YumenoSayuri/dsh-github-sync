@@ -1,15 +1,14 @@
 # Bundle patch for the GitHub sync plugin.
 #
-# The row points at a patch-relative path instead of a bare `@local/...`
-# specifier: the loader converts `./` paths to file URLs and finds the package by
-# walking up, so the row resolves no matter what the package is called or where
-# it is linked from.
+# The row points at a patch-relative path: the loader converts `./` paths to file
+# URLs and finds the package by walking up, so the row resolves no matter what the
+# package is called or where it is linked from.
 #
-# The filename is also the module-generation key: the Loader caches modules by
-# resolved URL and keeps serving the cached copy after a file's contents change.
-# To pick up an edit without restarting the app, every changed file needs a new
-# URL — rename the entry *and* the directory holding the changed modules. (Verified
-# here: renaming only the entry left internal/ modules stale.)
+# This filename is also the module-generation key. The Loader caches modules by
+# resolved URL and keeps serving a cached copy after a file's contents change, so
+# picking up an edit without restarting the app means giving *every changed file*
+# a new URL: rename the entry and the directory holding the changed modules.
+# (Verified: renaming only the entry leaves core/ modules stale.)
 - insert:
     - id: dsh-github-sync
-      name: './plugin.mjs'
+      name: './main.mjs'

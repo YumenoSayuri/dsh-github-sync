@@ -27,9 +27,9 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { ensureUserConfig, loadConfig, USER_CONFIG, writeUserToken, clearUserToken } from './internal/config.js'
-import { humanBytes, plan as buildPlan, execute, plan as planSync, resolveGit, scanRoots, writeStatus } from './internal/sync.js'
-import { arm, cwdOf, gateText, isArmed, observeStep, TOOLS } from './internal/prompt.js'
+import { ensureUserConfig, loadConfig, USER_CONFIG, writeUserToken, clearUserToken } from './core/config.js'
+import { humanBytes, plan as buildPlan, execute, plan as planSync, resolveGit, scanRoots, writeStatus } from './core/sync.js'
+import { arm, cwdOf, gateText, isArmed, observeStep, TOOLS } from './core/prompt.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -91,7 +91,9 @@ function statusReport(cwd) {
 	lines.push(`  git           ${git.ok ? git.resolved : `不可用 — ${git.hint}`}`)
 	lines.push(`  配置文件      ${config.files.user ?? `${USER_CONFIG}（还没有，已生成模板）`}`)
 	lines.push(`  仓库 topics   ${config.github.topics.length === 0 ? '（未启用）' : config.github.topics.join('、')}${config.github.topics.includes('dsh-plugin') ? `  → https://github.com/topics/dsh-plugin` : ''}`)
-	lines.push(`  推送方式      每个插件一个独立仓库，强制推成单次快照提交`)
+	lines.push(`  开源协议      ${config.github.license ?? '（未配置自动生成，缺失时仅告警）'}${config.github.license ? `，版权方 ${config.github.copyright || '（未设置）'}` : ''}`)
+	lines.push(`  本地镜像      ${config.mirrorsDir}`)
+	lines.push(`  推送方式      每个插件一个独立仓库；默认增量提交、普通推送（不覆盖远端），可用 force 显式强推`)
 	for (const warning of config.warnings ?? []) {
 		lines.push('')
 		lines.push(`  ! ${warning}`)
@@ -146,6 +148,16 @@ function planReport({ cwd, only, verbose }) {
 		lines.push(`  目录        ${plugin.dir}`)
 		lines.push(`  仓库        ${entry.repository ?? '（未配置 github.owner）'}  [${entry.visibility}]`)
 		lines.push(`  仓库 topics ${entry.topics.length === 0 ? '（不打标签）' : entry.topics.join('、')}`)
+		lines.push(
+			`  开源协议    ${
+				entry.licenseFile !== undefined
+					? `沿用插件里的 ${entry.licenseFile}`
+					: entry.licenseToGenerate !== undefined
+						? `缺失，将生成 ${entry.licenseToGenerate}（写入提交里的 LICENSE）`
+						: '缺失，且未配置自动生成（建议设 github.license）'
+			}`,
+		)
+		lines.push(`  本地镜像    ${entry.mirror}`)
 		lines.push(`  模式        ${manifest.mode === 'allowlist' ? 'include 白名单' : '默认排除 + .gitignore'}`)
 		lines.push(`  会推送      ${manifest.files.length} 个文件 / ${humanBytes(manifest.totalBytes)}`)
 		lines.push(`  会排除      ${manifest.excluded.length} 项`)
@@ -183,18 +195,24 @@ function planReport({ cwd, only, verbose }) {
  */
 function pushReport(outcome, dryRun) {
 	const lines = []
-	lines.push(dryRun ? 'GitHub 同步 — 试运行结果（没有推送）' : 'GitHub 同步 — 推送结果')
+	lines.push(dryRun ? 'GitHub 同步 — 试运行结果（没有提交，也没有推送）' : 'GitHub 同步 — 推送结果')
 	if (outcome.identity !== undefined) lines.push(`  身份        ${outcome.identity.login}（${outcome.identity.type}）`)
 	for (const warning of outcome.warnings) lines.push(`  ! ${warning}`)
 	lines.push('')
 	for (const result of outcome.results) {
-		const mark = result.outcome === 'failed' ? '✗' : result.outcome === 'skipped' ? '-' : '✓'
+		const mark =
+			result.outcome === 'failed' ? '✗' : result.outcome === 'skipped' || result.outcome === 'unchanged' ? '-' : '✓'
 		lines.push(`${mark} ${result.plugin}  [${result.outcome}]  ${result.files} 个文件 / ${humanBytes(result.bytes)}`)
 		for (const detail of result.detail) lines.push(`    ${detail}`)
 	}
 	const failed = outcome.results.filter((result) => result.outcome === 'failed').length
+	const changed = outcome.results.filter((result) => result.changed?.length > 0).length
+	const unchanged = outcome.results.filter((result) => result.outcome === 'unchanged').length
 	lines.push('')
-	lines.push(`合计：${outcome.results.length} 个插件，成功 ${outcome.results.length - failed}，失败 ${failed}。`)
+	lines.push(
+		`合计：${outcome.results.length} 个插件，有变更 ${changed}，无变更 ${unchanged}，失败 ${failed}。` +
+			(dryRun ? '（试运行，远端未改动）' : ''),
+	)
 	return lines.join('\n')
 }
 
@@ -357,7 +375,7 @@ export function apply(ctx) {
 	ctx.tools.register({
 		name: TOOLS.push,
 		description:
-			'把插件上传到各自的 GitHub 仓库：为每个插件建独立仓库（不存在时按配置创建），并把干净副本强制推成一次快照提交。这是唯一会写 GitHub 的工具，且只在人 /git 触发的那一轮里被允许调用。',
+			'把插件的干净副本提交并推送到各自的 GitHub 仓库：默认增量提交，历史累积（普通 push，不覆盖远端）；仓库不存在时按配置创建。这是唯一会写 GitHub 的工具，且只在人 /git 触发的那一轮里被允许调用。',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -366,10 +384,15 @@ export function apply(ctx) {
 					items: { type: 'string' },
 					description: '只推送这些插件。省略表示推送全部可推送的插件。'
 				},
-				commonMessage: { type: 'string', description: '覆盖提交说明模板（默认含插件名、版本、时间）。' },
+				commonMessage: { type: 'string', description: '覆盖本次提交说明（默认用配置里的模板，含插件名与版本）。' },
 				createRepos: { type: 'boolean', description: '仓库不存在时自动创建，默认 true。' },
 				verify: { type: 'boolean', description: '推送前用 GitHub API 确认仓库状态，默认 true。' },
-				dryRun: { type: 'boolean', description: '只做本地提交、不推送，用来验证打包是否正常。默认 false。' }
+				force: {
+					type: 'boolean',
+					description:
+						'强推：用本地镜像的历史替换远端分支，丢弃远端已有提交。仅当远端被别处改过且那些改动确实不需要时使用。默认 false（普通推送，被拒绝就报错）。'
+				},
+				dryRun: { type: 'boolean', description: '只同步本地镜像并报告将要发生的变更，不提交、不推送。默认 false。' }
 			}
 		},
 		output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
@@ -389,6 +412,7 @@ export function apply(ctx) {
 				dryRun: args?.dryRun === true,
 				createRepos: args?.createRepos !== false,
 				verify: args?.verify !== false,
+				force: args?.force === true,
 			})
 			writeStatus({
 				version: VERSION,

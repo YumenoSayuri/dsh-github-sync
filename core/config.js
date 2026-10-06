@@ -32,6 +32,10 @@ export const STATUS_FILE = join(HERE, 'sync.status.json')
 export const USER_DIR = join(homedir(), '.dsh', 'github-sync')
 /** The one file a human edits to hand the plugin a token. */
 export const USER_CONFIG = join(USER_DIR, 'config.json')
+/** One persistent clone per plugin: where the published commit history lives. */
+export const MIRRORS_DIR = join(USER_DIR, 'mirrors')
+/** Cached license bodies, so publishing never depends on the licenses endpoint twice. */
+export const LICENSES_DIR = join(USER_DIR, 'licenses')
 
 /** Accepted repository visibilities, GitHub's own vocabulary. */
 export const VISIBILITIES = ['private', 'public']
@@ -82,6 +86,8 @@ const TOP_LEVEL_KEYS = new Set([
 	'configFiles',
 	'workspaceRoot',
 	'pluginDirs',
+	'mirrorsDir',
+	'licensesDir',
 	'github',
 	'git',
 	'excludeNames',
@@ -254,6 +260,9 @@ function pluginEntry(key, value) {
 	if (entry.include !== undefined) entry.include = stringList(entry.include, `plugins.${key}.include`)
 	if (entry.exclude !== undefined) entry.exclude = stringList(entry.exclude, `plugins.${key}.exclude`)
 	if (entry.topics !== undefined) entry.topics = topicList(entry.topics)
+	if (entry.license !== undefined) {
+		entry.license = entry.license === null ? null : String(entry.license).trim()
+	}
 	if (entry.excludeNames !== undefined) entry.excludeNames = stringList(entry.excludeNames, `plugins.${key}.excludeNames`)
 	if (entry.excludePatterns !== undefined) {
 		entry.excludePatterns = stringList(entry.excludePatterns, `plugins.${key}.excludePatterns`)
@@ -368,6 +377,10 @@ export function loadConfig() {
 		},
 		workspaceRoot: typeof merged.workspaceRoot === 'string' && merged.workspaceRoot.trim() !== '' ? merged.workspaceRoot.trim() : undefined,
 		pluginDirs: stringList(merged.pluginDirs, 'pluginDirs'),
+		mirrorsDir:
+			typeof merged.mirrorsDir === 'string' && merged.mirrorsDir.trim() !== '' ? merged.mirrorsDir.trim() : MIRRORS_DIR,
+		licensesDir:
+			typeof merged.licensesDir === 'string' && merged.licensesDir.trim() !== '' ? merged.licensesDir.trim() : LICENSES_DIR,
 		github: {
 			owner: typeof githubRaw.owner === 'string' ? githubRaw.owner.trim() : '',
 			accountType: githubRaw.accountType === 'org' ? 'org' : 'user',
@@ -377,6 +390,20 @@ export function loadConfig() {
 			tokenSource: credential.source,
 			tokenOrigin: credential.origin,
 			topics: topicList(githubRaw.topics),
+			// null means "do not generate one"; the status report then nags instead.
+			license:
+				githubRaw.license === null || githubRaw.license === ''
+					? null
+					: typeof githubRaw.license === 'string' && githubRaw.license.trim() !== ''
+						? githubRaw.license.trim()
+						: null,
+			// Who the generated copyright line names. Defaults to the account owner.
+			copyright:
+				typeof githubRaw.copyright === 'string' && githubRaw.copyright.trim() !== ''
+					? githubRaw.copyright.trim()
+					: typeof githubRaw.owner === 'string'
+						? githubRaw.owner.trim()
+						: '',
 		},
 		git: {
 			executable: typeof gitRaw.executable === 'string' && gitRaw.executable.trim() !== '' ? gitRaw.executable.trim() : 'git',
