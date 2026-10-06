@@ -81,17 +81,26 @@ function failure({ action, response, token }) {
 /**
  * Read the identity the token belongs to.
  *
+ * The numeric id matters: GitHub's attributed noreply address is
+ * `<id>+<login>@users.noreply.github.com`, so knowing the id lets a commit be
+ * linked to the account without publishing the human's real address.
+ *
  * @param {object} options - request inputs.
  * @param {string} options.apiBase - API base URL.
  * @param {string} options.token - GitHub token.
- * @returns {Promise<{ login: string, type: string, name?: string }>} the authenticated account.
+ * @returns {Promise<{ login: string, id?: number, type: string, name?: string }>} the authenticated account.
  */
 export async function whoAmI({ apiBase, token }) {
 	const response = await api({ apiBase, token, path: '/user' })
 	if (response.status !== 200) throw failure({ action: '读取 GitHub 账号', response, token })
 	const login = response.json?.login
 	if (typeof login !== 'string' || login === '') throw new Error('GitHub 没有返回已登录账号，token 可能不是有效凭据。')
-	return { login, type: String(response.json?.type ?? 'User'), name: response.json?.name ?? undefined }
+	return {
+		login,
+		id: typeof response.json?.id === 'number' ? response.json.id : undefined,
+		type: String(response.json?.type ?? 'User'),
+		name: typeof response.json?.name === 'string' && response.json.name !== '' ? response.json.name : undefined,
+	}
 }
 
 /**

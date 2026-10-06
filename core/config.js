@@ -37,7 +37,45 @@ export const MIRRORS_DIR = join(USER_DIR, 'mirrors')
 /** Cached license bodies, so publishing never depends on the licenses endpoint twice. */
 export const LICENSES_DIR = join(USER_DIR, 'licenses')
 
-/** Accepted repository visibilities, GitHub's own vocabulary. */
+/**
+ * Default ceiling for one published file, in bytes.
+ *
+ * This is GitHub's own hard limit — "GitHub blocks files larger than 100 MiB" —
+ * not an invented number. Sitting at the platform's limit means the plugin never
+ * refuses something GitHub would have accepted; it only turns GitHub's opaque
+ * rejection into a clear message beforehand.
+ */
+export const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024
+
+/**
+ * Where GitHub starts warning, in bytes: "If you attempt to add or update a file
+ * that is larger than 50 MiB, you will receive a warning from Git." A publish in
+ * this band still succeeds, so the plugin warns rather than refuses.
+ */
+export const WARN_FILE_BYTES = 50 * 1024 * 1024
+
+/**
+ * Normalize the per-file size ceiling.
+ *
+ * A limit exists so an accidental multi-gigabyte artifact cannot be pushed, but
+ * exceeding it is a refusal to act, not a quiet omission: a plugin whose asset
+ * is dropped would be published broken, and the human would never know.
+ *
+ * @param {unknown} value - configured `maxFileBytes`.
+ * @returns {number} the effective ceiling in bytes.
+ */
+function maxFileBytesOf(value) {
+	if (value === undefined || value === null || value === '') return DEFAULT_MAX_FILE_BYTES
+	const bytes = typeof value === 'number' ? value : Number.parseInt(String(value), 10)
+	if (!Number.isFinite(bytes) || bytes <= 0) {
+		throw new Error('配置字段 maxFileBytes 必须是正整数字节数（例如 8388608 表示 8 MiB）')
+	}
+	return Math.floor(bytes)
+}
+
+/**
+ * Accepted repository visibilities, GitHub's own vocabulary.
+ */
 export const VISIBILITIES = ['private', 'public']
 
 /**
@@ -88,6 +126,7 @@ const TOP_LEVEL_KEYS = new Set([
 	'pluginDirs',
 	'mirrorsDir',
 	'licensesDir',
+	'maxFileBytes',
 	'github',
 	'git',
 	'excludeNames',
@@ -377,6 +416,7 @@ export function loadConfig() {
 		},
 		workspaceRoot: typeof merged.workspaceRoot === 'string' && merged.workspaceRoot.trim() !== '' ? merged.workspaceRoot.trim() : undefined,
 		pluginDirs: stringList(merged.pluginDirs, 'pluginDirs'),
+		maxFileBytes: maxFileBytesOf(merged.maxFileBytes),
 		mirrorsDir:
 			typeof merged.mirrorsDir === 'string' && merged.mirrorsDir.trim() !== '' ? merged.mirrorsDir.trim() : MIRRORS_DIR,
 		licensesDir:
@@ -407,11 +447,12 @@ export function loadConfig() {
 		},
 		git: {
 			executable: typeof gitRaw.executable === 'string' && gitRaw.executable.trim() !== '' ? gitRaw.executable.trim() : 'git',
-			userName: typeof gitRaw.userName === 'string' && gitRaw.userName.trim() !== '' ? gitRaw.userName.trim() : 'dsh-github-sync',
-			userEmail:
-				typeof gitRaw.userEmail === 'string' && gitRaw.userEmail.trim() !== ''
-					? gitRaw.userEmail.trim()
-					: 'dsh-github-sync@users.noreply.github.com',
+			// Left undefined on purpose: the committer identity is derived from the
+			// authenticated GitHub account (name + its noreply address) so commits are
+			// attributed to the human who wrote them. Inventing a bot identity here
+			// would make every commit show up as an unlinked stranger on GitHub.
+			userName: typeof gitRaw.userName === 'string' && gitRaw.userName.trim() !== '' ? gitRaw.userName.trim() : undefined,
+			userEmail: typeof gitRaw.userEmail === 'string' && gitRaw.userEmail.trim() !== '' ? gitRaw.userEmail.trim() : undefined,
 			branch: typeof gitRaw.branch === 'string' && gitRaw.branch.trim() !== '' ? gitRaw.branch.trim() : 'main',
 			commitMessageTemplate:
 				typeof gitRaw.commitMessageTemplate === 'string' && gitRaw.commitMessageTemplate.trim() !== ''
@@ -515,14 +556,23 @@ export function ensureUserConfig() {
 		_comment_2: 'github.owner 填你的 GitHub 用户名（插件目录里的 sync.config.json 里如果已经填了，这里可以留空）。',
 		_comment_3: 'github.token 填 token 本身（ghp_… 或 github_pat_…）。不要把 token 写到插件目录里。',
 		_comment_4: 'github.topics 是给新仓库打的 GitHub topic，「联合投稿」用；默认就是 dsh-plugin，不想打标签就写 []。',
+		_comment_5: 'github.license：插件里没有 LICENSE 时自动生成哪个协议（MIT / Apache-2.0 / BSD-3-Clause / MPL-2.0 / GPL-3.0 / Unlicense…）。留空表示不生成，只在状态里提醒你——选协议是法律决定，工具不替你定。',
+		_comment_6: 'github.copyright：自动生成的版权行署名；留空则用 github.owner。',
+		_comment_7: 'git.userEmail / git.userName 是**提交署名**。两者都留空，就用 token 所属账号派生：名字取账号显示名，邮箱用 <你的ID>+<用户名>@users.noreply.github.com —— 能关联到你的头像，又不公开真实邮箱。',
+		_comment_8: '想署自己的邮箱就填 git.userEmail，但该邮箱必须**先在 GitHub 账号里验证过**；否则提交在 GitHub 上会显示成一个无头像、点不开的陌生人。另外注意：写进提交的邮箱是公开的。',
 		github: {
 			owner: '',
 			token: '',
 			topics: ['dsh-plugin'],
+			license: '',
+			copyright: '',
+		},
+		git: {
+			userName: '',
+			userEmail: '',
 		},
 	}
 	writeFileSync(USER_CONFIG, `${JSON.stringify(skeleton, null, 2)}\n`, 'utf8')
 	return USER_CONFIG
 }
 
-export default loadConfig

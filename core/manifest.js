@@ -16,10 +16,30 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { NOISE_PATTERNS, NOISE_SEGMENTS } from './config.js'
+import { DEFAULT_MAX_FILE_BYTES, NOISE_PATTERNS, NOISE_SEGMENTS, WARN_FILE_BYTES } from './config.js'
 
-/** Upper bound for a single shipped file; anything larger is reported, not copied. */
-export const MAX_FILE_BYTES = 8 * 1024 * 1024
+/**
+ * Upper bound for a single published file.
+ *
+ * Re-exported for callers that only want the default; the effective value comes
+ * from configuration, because a plugin with a legitimately large asset must be
+ * able to say so instead of quietly shipping without it.
+ */
+export const MAX_FILE_BYTES = DEFAULT_MAX_FILE_BYTES
+
+/**
+ * Format a byte count for a human. Sizes here are usually MiB-scale, but the
+ * ceiling is configurable and may be set small on purpose, so smaller units are
+ * real rather than decorative.
+ *
+ * @param {number} bytes - the byte count.
+ * @returns {string} a short human-readable size.
+ */
+function humanSize(bytes) {
+	if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+	if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+	return `${bytes} B`
+}
 
 /**
  * Translate one glob into a regular expression. Supported syntax is the subset
@@ -174,13 +194,15 @@ function listedBy(include, path, name) {
  * @param {Record<string, unknown>} [options.entry] - the plugin's configured entry.
  * @param {string[]} [options.excludeNames] - extra segment names to drop.
  * @param {string[]} [options.excludePatterns] - extra glob patterns to drop.
+ * @param {number} [options.maxFileBytes] - ceiling for one published file.
  * @returns {Manifest} included files, excluded paths with reasons, and notes.
  */
-export function buildManifest({ dir, entry = {}, excludeNames = [], excludePatterns = [] }) {
+export function buildManifest({ dir, entry = {}, excludeNames = [], excludePatterns = [], maxFileBytes = DEFAULT_MAX_FILE_BYTES }) {
 	const include = Array.isArray(entry.include) ? entry.include.map(includePrefix) : undefined
 	const policies = Array.isArray(entry.policies) ? entry.policies.map(String) : []
 	const useGitignore = policies.length === 0 || policies.includes('gitignore')
 	const useDefaults = policies.length === 0 || policies.includes('defaults')
+	const limit = maxFileBytes > 0 ? maxFileBytes : DEFAULT_MAX_FILE_BYTES
 	const extraNames = [...NOISE_SEGMENTS, ...excludeNames, ...(Array.isArray(entry.excludeNames) ? entry.excludeNames : [])]
 	const extraPatterns = [...NOISE_PATTERNS, ...excludePatterns, ...(Array.isArray(entry.excludePatterns) ? entry.excludePatterns : [])]
 
@@ -190,6 +212,8 @@ export function buildManifest({ dir, entry = {}, excludeNames = [], excludePatte
 	const excluded = []
 	/** @type {{ path: string, kind: string }[]} */
 	const secrets = []
+	/** @type {string[]} */
+	const warnings = []
 	const notes = []
 	let skippedSymlinks = 0
 	let oversized = 0
@@ -299,17 +323,36 @@ export function buildManifest({ dir, entry = {}, excludeNames = [], excludePatte
 				notes.push(`stat 失败：${childRel}（${error.message}）`)
 				continue
 			}
-			if (info.size > MAX_FILE_BYTES) {
+			if (info.size > limit) {
+				// Refuse rather than omit: dropping the file would publish a plugin that
+				// is quietly broken, and the human would have no way to notice. A note
+				// becomes a blocker upstream, so the push stops until someone decides —
+				// either drop the file or raise maxFileBytes on purpose.
 				oversized++
-				excluded.push({ path: childRel, reason: `超过单文件上限 ${Math.floor(MAX_FILE_BYTES / 1024 / 1024)} MiB` })
+				const human = humanSize(limit)
+				excluded.push({ path: childRel, reason: `超过单文件上限 ${human}` })
+				notes.push(
+					`${childRel} 有 ${humanSize(info.size)}，超过单文件上限 ${human}，已停止发布。` +
+						'若这个大文件确实要随插件发布，请在 sync.config.json 调大 maxFileBytes（字节数）；否则请把它排除掉。',
+				)
 				continue
+			}
+			if (info.size > WARN_FILE_BYTES) {
+				// GitHub itself warns above 50 MiB and still accepts the push, so this is
+				// a warning rather than a refusal: the human should know before the
+				// repository gets heavy, but nothing is blocked.
+				warnings.push(
+					`${childRel} 有 ${humanSize(info.size)}，超过 GitHub 的 ${humanSize(WARN_FILE_BYTES)} 警告线。` +
+						'推送仍会成功，但仓库会明显变重；大文件更适合放到 release 附件或 Git LFS。',
+				)
 			}
 
 			// Last gate before a file is allowed to ship: does it carry a
 			// credential? This exists because a plugin directory is exactly where a
 			// token gets pasted by mistake — into a config file that then looks like
-			// an ordinary part of the package.
-			const secret = secretIn(childAbs, childRel, info.size)
+			// an ordinary part of the package. The scan covers every file we are
+			// willing to publish, so a large text file cannot slip past it.
+			const secret = secretIn(childAbs, childRel, info.size, limit)
 			if (secret !== undefined) {
 				secrets.push({ path: childRel, kind: secret })
 				excluded.push({ path: childRel, reason: `疑似密钥，不推送（${secret}）` })
@@ -337,6 +380,7 @@ export function buildManifest({ dir, entry = {}, excludeNames = [], excludePatte
 		files,
 		excluded: excludedSorted,
 		secrets,
+		warnings,
 		totalBytes,
 		notes,
 		skippedSymlinks,
@@ -344,8 +388,14 @@ export function buildManifest({ dir, entry = {}, excludeNames = [], excludePatte
 	}
 }
 
-/** Upper bound for a file whose text is scanned for credentials. */
-export const MAX_SCAN_BYTES = 1024 * 1024
+/**
+ * Default upper bound for a file whose text is scanned for credentials.
+ *
+ * The effective bound follows `maxFileBytes`: everything eligible to be
+ * published is also eligible to be scanned, so a large text file cannot carry a
+ * credential past the gate by being big.
+ */
+export const MAX_SCAN_BYTES = DEFAULT_MAX_FILE_BYTES
 
 /**
  * Credential shapes worth refusing to publish. Each entry is a name shown to a
@@ -409,17 +459,18 @@ const SCANNABLE_EXTENSIONS = new Set([
 /**
  * Look for a credential inside one file.
  *
- * Only text-shaped files under the scan size are read; anything else is skipped,
- * because a token lives in text and reading 20 MiB of PNG bytes to prove that is
- * a waste.
+ * Only text-shaped files are read; a PNG is skipped, because a token lives in
+ * text and reading megabytes of pixels to prove that is a waste. The size bound
+ * follows the publish ceiling so nothing publishable escapes the scan.
  *
  * @param {string} absolute - absolute file path.
  * @param {string} rel - `/`-separated path, used for the extension test.
  * @param {number} size - file size in bytes.
+ * @param {number} [bound] - the ceiling above which the file is not published anyway.
  * @returns {string | undefined} the credential kind, when one is found.
  */
-function secretIn(absolute, rel, size) {
-	if (size === 0 || size > MAX_SCAN_BYTES) return undefined
+function secretIn(absolute, rel, size, bound = MAX_SCAN_BYTES) {
+	if (size === 0 || size > bound) return undefined
 	const dot = rel.lastIndexOf('.')
 	const extension = dot === -1 ? '' : rel.slice(dot).toLowerCase()
 	const baseName = rel.slice(rel.lastIndexOf('/') + 1)

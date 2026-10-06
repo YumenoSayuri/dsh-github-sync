@@ -19,7 +19,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { USER_CONFIG } from './config.js'
@@ -29,6 +29,87 @@ import { USER_CONFIG } from './config.js'
  * pushed under this name; the configured branch is moved onto the commit.
  */
 const SNAPSHOT_BRANCH = 'dsh-snapshot'
+
+/**
+ * Read one file from the clean copy, by manifest path (case-insensitive).
+ *
+ * @param {object} manifest - the clean-copy manifest.
+ * @param {string} name - the file name to look for, lower case.
+ * @returns {string | undefined} the file text, when it is part of the clean copy.
+ */
+function manifestText(manifest, name) {
+	const file = (manifest.files ?? []).find((candidate) => candidate.path.toLowerCase() === name)
+	if (file === undefined || typeof manifest.dir !== 'string') return undefined
+	try {
+		return readFileSync(join(manifest.dir, file.path), 'utf8')
+	} catch {
+		return undefined
+	}
+}
+
+/**
+ * Pull `version` out of a package manifest.
+ *
+ * @param {string | undefined} text - the package.json contents.
+ * @returns {string | undefined} the declared version.
+ */
+function versionOf(text) {
+	if (text === undefined) return undefined
+	try {
+		const value = JSON.parse(text)?.version
+		return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+	} catch {
+		return undefined
+	}
+}
+
+/**
+ * Check the two publication conventions, and say so when they are broken.
+ *
+ * Both are warnings rather than blockers: neither is illegal, and refusing to
+ * publish over a version number would be worse than publishing with a note. The
+ * point is that the human hears about it at the moment it happens, instead of
+ * discovering a flat 0.1.0 history months later.
+ *
+ * @param {object} options - check inputs.
+ * @param {object} options.base - the git invocation context.
+ * @param {object} options.manifest - the clean-copy manifest.
+ * @param {{ code: string, path: string }[]} options.changed - what this commit changes.
+ * @param {string | undefined} options.baseRef - the previous published state, if any.
+ * @returns {Promise<string[]>} the convention warnings.
+ */
+async function conventionWarnings({ base, manifest, changed, baseRef }) {
+	const warnings = []
+	const current = versionOf(manifestText(manifest, 'package.json'))
+	if (current === undefined) return warnings
+	const previous =
+		baseRef === undefined
+			? undefined
+			: versionOf(
+					await run({ ...base, args: ['show', `${baseRef}:package.json`] }).then(
+						(result) => result.stdout,
+						() => undefined,
+					),
+				)
+	if (previous === undefined) return warnings
+
+	if (changed.length > 0 && previous === current) {
+		warnings.push(
+			`这次有 ${changed.length} 处变更，但 package.json 的 version 还是 ${current}，没有升版本。` +
+				'按约定，有改动的发布应当升版本，并在 README 的「版本历史」里记一行。',
+		)
+	}
+	if (previous !== current) {
+		const readme = manifestText(manifest, 'readme.md')
+		if (readme !== undefined && !readme.includes(current)) {
+			warnings.push(
+				`版本从 ${previous} 升到 ${current}，但 README 里找不到 ${current}。` +
+					'按约定，README 末尾应有「版本历史」小节，按版本倒序记录（含年月日时分）。',
+			)
+		}
+	}
+	return warnings
+}
 
 /**
  * Turn git's rejection text into something a human can act on.
@@ -345,6 +426,16 @@ export async function publish({
 		() => undefined,
 	)
 
+	// Convention checks. A version number and its record in the README are what a
+	// stranger reads first, and "I forgot to bump it" stays invisible for a long
+	// time — so these are looked up rather than trusted to anyone's memory.
+	const conventions = await conventionWarnings({
+		base,
+		manifest,
+		changed,
+		baseRef: remoteExists && !force ? remoteRef : undefined,
+	})
+
 	const common = {
 		sha: head,
 		branch,
@@ -353,6 +444,7 @@ export async function publish({
 		written: synced.written,
 		removed: synced.removed,
 		changed,
+		warnings: conventions,
 		baseCommits,
 		mirror,
 		firstPublish,

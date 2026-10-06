@@ -23,6 +23,7 @@
  * that performs the upload.
  */
 
+import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +33,77 @@ import { humanBytes, plan as buildPlan, execute, plan as planSync, resolveGit, s
 import { arm, cwdOf, gateText, isArmed, observeStep, TOOLS } from './core/prompt.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * Deep-freeze a value in place, the way the harness freezes its own messages.
+ *
+ * @param {unknown} value - the value to freeze.
+ * @returns {unknown} the same value, frozen.
+ */
+function deepFreeze(value) {
+	if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+		Object.freeze(value)
+		for (const nested of Object.values(value)) deepFreeze(nested)
+	}
+	return value
+}
+
+/**
+ * Build an identified user-role message without the harness factory.
+ *
+ * The harness's own `createUserMessage` (`@deepseek-ai/dsh-llm`) is exactly
+ * `deepFreeze(structuredClone({ ...input, role: 'user', id: randomUUID() }))`;
+ * this is the same thing, and it exists for one reason. A message reaching
+ * `agent.steer()` is written into the session journal as a `user/message` event
+ * verbatim, and replay rejects an event whose `id` is not a non-empty string —
+ * failing the load of the whole session, not just that turn. Depending on an
+ * app-internal package to get that id would trade a small correctness risk for a
+ * much larger one: an unresolvable import fails the *bundle*, which silently
+ * removes the `/git` gate and every tool with it.
+ *
+ * @param {object} input - message content and source.
+ * @returns {object} an identified, frozen user message.
+ */
+function localUserMessage(input) {
+	return deepFreeze(structuredClone({ ...input, role: 'user', id: randomUUID() }))
+}
+
+/** The harness factory once it resolves, or undefined while unknown/absent. */
+let harnessUserMessage
+
+/** Set once the factory has been looked up, so the attempt happens at most once. */
+let factoryLookup
+
+/**
+ * Look up the harness message factory in the background.
+ *
+ * Resolution is attempted once, at load, and never awaited: the app's packages
+ * live inside its own archive (`/dsh/node_modules/...`), which a plugin loaded
+ * from a workspace directory may or may not resolve, so both outcomes are normal.
+ * Whichever factory wins, a message carries a real `id`.
+ *
+ * @returns {Promise<void>} resolves once the lookup has been attempted.
+ */
+function primeUserMessageFactory() {
+	if (factoryLookup !== undefined) return factoryLookup
+	factoryLookup = import('@deepseek-ai/dsh-llm').then(
+		(module) => {
+			if (typeof module?.createUserMessage === 'function') harnessUserMessage = module.createUserMessage
+		},
+		() => undefined,
+	)
+	return factoryLookup
+}
+
+/**
+ * Create the user message `/git` injects.
+ *
+ * @param {object} input - message content and source.
+ * @returns {object} an identified, frozen user message.
+ */
+function userMessage(input) {
+	return (harnessUserMessage ?? localUserMessage)(input)
+}
 
 /** This package's own version, reported in diagnostics. */
 const VERSION = (() => {
@@ -93,6 +165,16 @@ function statusReport(cwd) {
 	lines.push(`  仓库 topics   ${config.github.topics.length === 0 ? '（未启用）' : config.github.topics.join('、')}${config.github.topics.includes('dsh-plugin') ? `  → https://github.com/topics/dsh-plugin` : ''}`)
 	lines.push(`  开源协议      ${config.github.license ?? '（未配置自动生成，缺失时仅告警）'}${config.github.license ? `，版权方 ${config.github.copyright || '（未设置）'}` : ''}`)
 	lines.push(`  本地镜像      ${config.mirrorsDir}`)
+	lines.push(`  单文件上限    ${humanBytes(config.maxFileBytes)}（GitHub 硬上限为 100 MiB；超过 50 MiB 会警告但可推）`)
+	lines.push(
+		`  提交署名      ${
+			config.git.userEmail !== undefined
+				? `${config.git.userName ?? '（名字按账号派生）'} <${config.git.userEmail}>  邮箱来自配置`
+				: config.git.userName !== undefined
+					? `${config.git.userName} <（邮箱按账号派生的 noreply 地址）>  名字来自配置`
+					: '留空 → 名字与邮箱都按 token 所属账号派生（noreply 邮箱可关联头像且不暴露真实邮箱）'
+		}`,
+	)
 	lines.push(`  推送方式      每个插件一个独立仓库；默认增量提交、普通推送（不覆盖远端），可用 force 显式强推`)
 	for (const warning of config.warnings ?? []) {
 		lines.push('')
@@ -197,6 +279,9 @@ function pushReport(outcome, dryRun) {
 	const lines = []
 	lines.push(dryRun ? 'GitHub 同步 — 试运行结果（没有提交，也没有推送）' : 'GitHub 同步 — 推送结果')
 	if (outcome.identity !== undefined) lines.push(`  身份        ${outcome.identity.login}（${outcome.identity.type}）`)
+	if (outcome.committer !== undefined) {
+		lines.push(`  提交署名    ${outcome.committer.name} <${outcome.committer.email}>  ${outcome.committer.source}`)
+	}
 	for (const warning of outcome.warnings) lines.push(`  ! ${warning}`)
 	lines.push('')
 	for (const result of outcome.results) {
@@ -268,6 +353,10 @@ export function apply(ctx) {
 		// A read-only install still works; the token can come from the environment.
 	}
 
+	// Look the harness message factory up now, so `/git` — which a human types
+	// later — finds it ready, and never blocks a command on a module lookup.
+	void primeUserMessageFactory()
+
 	ctx.effect(
 		() => ctx.systemPrompt.section({ name: 'dsh-github-sync', order: SECTION_ORDER, text: gateText }),
 		'dsh-github-sync: gated system prompt section',
@@ -312,11 +401,19 @@ export function apply(ctx) {
 				// push tool for exactly the turn this message starts.
 				arm(agent, rawInput)
 				const text = statusReport(cwd)
-				agent.steer({
-					role: 'user',
-					content: [{ type: 'text', text: overlay(cwd, rawInput) }],
-					source: { kind: 'user' },
-				})
+				// Build the injected turn through an identified message. A bare
+				// `{ role, content, source }` object looks right in memory but has no
+				// `id`, and the session journal records `user/message` verbatim: the
+				// harness rejects the stored event on replay ("lacks an identified
+				// message"), which corrupts load-through-history for the whole session.
+				// The harness's own factory is preferred when it resolves; otherwise an
+				// equivalent local one supplies the id.
+				agent.steer(
+					userMessage({
+						content: [{ type: 'text', text: overlay(cwd, rawInput) }],
+						source: { kind: 'user' },
+					}),
+				)
 				writeStatus({
 					version: VERSION,
 					armed: true,

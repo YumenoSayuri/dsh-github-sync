@@ -24,6 +24,12 @@
    - 符号链接不跟随（避免把仓库外的内容复制进去）。
    - 插件若自带 `.gitignore` 或配置了 `include` 白名单，一律尊重（`include` 白名单也不会绕过密钥扫描）。
    - **每次提交的内容都精确等于干净副本**：发布时会先把镜像工作树清空、再按干净副本写入，因此不只是"只加不删"——先前误提交过的缓存/状态文件，会在下一次提交里作为删除出现在**历史**中（可追溯，不是静默改写）。
+   - **单文件大小沿用 GitHub 自己的数字，不自定**：默认上限 `maxFileBytes = 100 MiB`，正是 GitHub 的硬上限（官方原文：*GitHub blocks files larger than 100 MiB*）；超过 `50 MiB` 按 GitHub 的规则给**警告**但仍可推（官方原文：*you will receive a warning from Git*）。超过上限是**阻断项**而非静默漏掉——静默丢文件会发布出一个悄悄坏掉的插件。密钥扫描的范围与上限一致，大文本文件无法靠体积绕过扫描。
+
+4. **提交署名归你（不是工具的假身份）**：
+   - 提交的作者署名默认**按 token 所属账号派生**，邮箱用 GitHub 的 noreply 形式 `<ID>+<用户名>@users.noreply.github.com`：既能关联到你的头像，又不公开真实邮箱。
+   - 想用自己的邮箱就配 `git.userEmail`（`git.userName` 可选）。**前提是该邮箱已在 GitHub 账号里验证过**：GitHub 靠邮箱归属提交，没验证过的邮箱会让提交显示成一个没有头像、点不开的陌生人。
+   - 注意 git 的性质：写进提交的邮箱是**公开**的。不想公开就用默认的 noreply 形式。
 
 4. **标准 git 流程：增量提交、真实历史、普通推送**：
    - 每个插件一个**常驻本地镜像仓库**（clone），存放在 `%USERPROFILE%\.dsh\github-sync\mirrors\<仓库名>`，`.git` 保留 → 历史正常累积。
@@ -77,6 +83,7 @@
 
 `owner` 也可以写在插件目录的 `sync.config.json` 里；用户文件里的**空字符串不会覆盖**插件目录里已填的值（留空即"未指定"，要清空请写 `null`）。
 `github.license` 留空表示不自动生成（只在状态里告警）；`github.copyright` 留空则用 `github.owner`。
+想让提交署自己的名字/邮箱，再加一段 `"git": { "userName": "你的名字", "userEmail": "你的邮箱" }`；**该邮箱要先在 GitHub 账号里验证过**才会关联到你的头像。留空则自动用账号的 noreply 邮箱（可关联、且不公开真实邮箱）。
 
 > **Token 权限要求**（依据 GitHub REST 官方文档核实）
 >
@@ -154,3 +161,49 @@ sync.status.json        运行期诊断（自动生成，永不推送）
 ```
 
 （`src/`、`lib/`、`internal/` 与 `index.js`、`host.mjs`、`plugin.mjs` 都是同一份代码的早期名字：因为上面的模块缓存机制，每次改动都得换 URL，所以历史名被留在了旧代次里。今后请优先重启 DSH，别靠改名。）
+
+## 发布约定
+
+这个插件自己也遵守它检查别人的那两条约定（`/git` 的说明里会声明一次）：
+
+1. **有改动就升 `package.json` 的 `version`**。文件变了而版本没变，插件会在推送结果里警告。
+2. **README 末尾保留本节，按版本倒序**，每条含版本号与年月日时分。升了版本但 README 里搜不到该版本号，插件同样会警告。
+
+---
+
+## 📌 版本历史
+
+### v0.2.2（2026-10-06 17:20）
+
+- **让"消息工厂"的解析变成可失败但不致命**：v0.2.1 改成静态 `import { createUserMessage } from '@deepseek-ai/dsh-llm'`，但**实测该裸模块名从插件目录解析不到**（宿主的包在 `app.asar` 内的 `/dsh/node_modules/`，插件在外部，Node 只会从插件目录往上找 `node_modules`）。静态 import 解析失败会让**整个 bundle 加载失败**——`/git` 闸门与三个工具会一起消失，比原 bug 更严重。
+- 现在是**加载期后台尝试 + 失败容忍**：能解析就用宿主官方工厂，解析不到就用**语义等价**的本地实现（`deepFreeze(structuredClone({ ...input, role: 'user', id: randomUUID() }))`，与宿主 `createMessage` 逐字对应）。两条路径产出的消息都带非空 `id`，都不会破坏会话回放。
+- 新增测试 `ghsync-steer-test.mjs`：驱动真实 bundle 与真实 `apply()`，断言真正进入收件箱的消息具备 `id`/`role`/`source`/`content` 且被冻结、两次注入 id 不同。**故意不桩掉 `@deepseek-ai/dsh-llm`**——"这个包能否解析"正是必须不影响结果的那件事。
+- 顺带记录一个**宿主自身的坑**：`dsh-agent/README.md` 里 `steer()` 的官方示例只写了 `content` 与 `source`（**没有 `id`**），而 `steer(input)` 的实现是原样 `inbox.splice(input)`、不补 id，所以照文档写出来的插件会写出回放时校验失败的会话事件。宿主自己的调用方（`dsh-api-session-controller`）都是先用 `createUserMessage` 造消息再 `steer`，照它做才对。
+- **补齐自动生成的用户配置模板**：模板原先只有 `github.owner` / `token` / `topics`，新装的人根本不知道还能配**提交署名**和**开源协议**。现在模板同时列出 `git.userName` / `git.userEmail` 与 `github.license` / `github.copyright`，并注明"留空就按账号派生 noreply 邮箱（可关联头像、不公开真实邮箱）""自填邮箱需先在 GitHub 账号里验证过"。默认值仍安全留白：协议留空 = **不替你选协议**，只提醒。
+- 顺带清理：`core/prompt.js`、`core/config.js` 末尾多余的 `export default`（`unwrapExports` 的 `exports.default ?? exports` 会因此把具名导出整片遮掉，属同一类坑）。
+
+### v0.2.1（2026-10-06 12:36）
+
+- **修复 `/git` 注入的消息缺 `id`，导致会话历史加载失败**：`/git` 之前用裸对象 `{ role, content, source }` 调 `agent.steer()`，而会话日志按原样记录 `user/message`，缺少 `id` 的事件在重启回放时被校验器拒绝——报 `session event at seq N lacks an identified message`，整个会话的历史加载都会失败（不只是 `/git` 那一轮）。
+- 现在改用 harness 工厂 `createUserMessage`（来自 `@deepseek-ai/dsh-llm`）构造消息，由它生成并冻结 `id`，与其余用户消息一致。
+- 仅影响 `/git` 注入的轮次；已写坏的历史事件需要单独修补，插件本身无法回改。
+
+### v0.2.0（2026-10-06 11:31）
+
+- **改用标准 git 流程**：每个插件一个常驻本地镜像（`%USERPROFILE%\.dsh\github-sync\mirrors\<仓库名>`），每次发布是**增量提交**并**普通推送**，历史累积、可用 `git log`/`blame`/`revert`；无变更不产生空提交。
+- 推送前先 `fetch` 并**以远端 tip 为基准**提交，所以别人在网页或别处推上来的提交会被保留，不会被覆盖。
+- **强推保留为显式选项** `force`：生成孤立根提交（干净副本）替换远端历史，用于"某个提交必须消失"（例如误提交密钥），不是日常发布。
+- **新增开源协议支持**：插件已有 `LICENSE` 则沿用；缺失且配置了 `github.license` 时从 GitHub 官方接口取正文（替换版权行、缓存到本地）写进同一提交；未配置只告警——选协议是法律决定，不替用户定。
+- **提交署名归账号**：默认按 token 所属账号派生，用 `<ID>+<用户名>@users.noreply.github.com`，可关联头像且不公开真实邮箱；可用 `git.userName`/`git.userEmail` 覆盖。
+- **单文件上限对齐 GitHub 官方数字**：默认 `maxFileBytes = 100 MiB`（官方硬上限），超过 50 MiB 按官方规则警告但可推；超限是**阻断项**而非静默漏掉。密钥扫描范围与上限一致。
+- 推送被拒时区分**竞态**（重跑即可）与**分支保护**（需去仓库设置改），不再笼统报错。
+- 提交内容严格等于干净副本：干净副本里没有的文件会在下次提交中作为**删除**出现在历史里。
+- 新增上述两条**发布约定检查**（有改动没升版本 / 升了版本 README 没记）。
+
+### v0.1.0（2026-10-05 16:16）
+
+- 首次发布。把插件作为干净副本推送到独立 GitHub 仓库，单次快照强制推送。
+- `/git` 单轮授权闸门：平时零注入，插件绝不自动上传，未授权轮的推送工具调用会被硬拦截。
+- token 只存机器级用户目录，经临时凭据助手交给 git，不进命令行、URL 或报错文本；发布前做密钥扫描。
+- `dsh-` 前缀命名约定（文件夹即仓库名），不合规列为阻断项并给出确切改名建议。
+- 默认给仓库打 `dsh-plugin` topic（联合投稿汇总页），在代码推送成功后设置。

@@ -162,6 +162,7 @@ export function plan({ config, cwd, only }) {
 			entry: plugin.entry,
 			excludeNames: config.excludeNames,
 			excludePatterns: config.excludePatterns,
+			maxFileBytes: config.maxFileBytes,
 		})
 		const entry = {
 			plugin,
@@ -174,6 +175,7 @@ export function plan({ config, cwd, only }) {
 			// generated into the same commit. Planning states the intent without
 			// fetching anything, so a preview stays offline.
 			licenseFile: licenseFileOf(manifest),
+			warnings: manifest.warnings ?? [],
 			licenseToGenerate: licenseWanted(config, plugin),
 			blockers: [],
 			skipReason: undefined,
@@ -244,8 +246,13 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 		)
 	}
 
+	// The identity is read whenever a push is possible — not only when the
+	// repository has to be checked or created — because it decides who the commit
+	// is attributed to. Getting that wrong makes every commit show up on GitHub as
+	// an unlinked stranger.
 	let identity
-	if (needApi) {
+	const wantIdentity = !dryRun && typeof token === 'string' && token.trim() !== ''
+	if (wantIdentity) {
 		identity = await whoAmI({ apiBase: config.github.apiBase, token })
 		if (config.github.owner !== '' && identity.login.toLowerCase() !== config.github.owner.toLowerCase() && config.github.accountType !== 'org') {
 			warnings.push(
@@ -254,11 +261,15 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 			)
 		}
 	}
+	const committer = committerFrom(config, identity)
 
 	/** @type {PushResult[]} */
 	const results = []
 	for (const entry of planValue.entries) {
 		const { plugin, manifest } = entry
+		for (const warning of entry.warnings ?? manifest.warnings ?? []) {
+			if (!warnings.includes(warning)) warnings.push(warning)
+		}
 		const record = {
 			plugin: plugin.repo,
 			package: plugin.name,
@@ -339,13 +350,16 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 				branch: config.git.branch,
 				commitMessage: commitMessage(config.git.commitMessageTemplate, plugin),
 				git: config.git.executable,
-				userName: config.git.userName,
-				userEmail: config.git.userEmail,
+				userName: committer.name,
+				userEmail: committer.email,
 				token,
 				tokenFile: USER_CONFIG,
 				dryRun,
 				force,
 			})
+			for (const warning of published.warnings ?? []) {
+				if (!warnings.includes(warning)) warnings.push(warning)
+			}
 			record.sha = published.sha
 			record.files = published.files
 			record.mirror = published.mirror
@@ -394,7 +408,48 @@ export async function execute({ config, plan: planValue, dryRun = false, createR
 		results.push(record)
 	}
 
-	return { results, warnings, identity }
+	return { results, warnings, identity, committer }
+}
+
+/**
+ * Decide who a commit is signed by.
+ *
+ * Configuration wins when it is set, because a human may deliberately publish
+ * under a project identity. Otherwise the authenticated account is used, with
+ * GitHub's attributed noreply address so the commit is linked to the profile
+ * while the real email stays private.
+ *
+ * Note what attribution actually requires: the email on the commit must belong to
+ * (and be verified on) that GitHub account. An arbitrary address produces a
+ * commit GitHub cannot link, which is exactly what a made-up bot identity did.
+ *
+ * @param {ResolvedConfig} config - the resolved configuration.
+ * @param {{ login: string, id?: number, name?: string } | undefined} identity - the token's account.
+ * @returns {{ name: string, email: string, source: string }} the committer identity.
+ */
+function committerFrom(config, identity) {
+	const configuredName = config.git.userName
+	const configuredEmail = config.git.userEmail
+	const login = identity?.login
+	const fallbackName = login ?? 'dsh-github-sync'
+	const fallbackEmail =
+		login !== undefined && typeof identity?.id === 'number'
+			? `${identity.id}+${login}@users.noreply.github.com`
+			: login !== undefined
+				? `${login}@users.noreply.github.com`
+				: 'dsh-github-sync@users.noreply.github.com'
+	const name = configuredName ?? identity?.name ?? fallbackName
+	const email = configuredEmail ?? fallbackEmail
+	return {
+		name,
+		email,
+		source:
+			configuredName !== undefined || configuredEmail !== undefined
+				? '来自配置（git.userName / git.userEmail）'
+				: identity === undefined
+					? '默认值（未能读到账号）'
+					: `按账号 ${login} 派生`,
+	}
 }
 
 /**
