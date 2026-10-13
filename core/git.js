@@ -19,7 +19,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { USER_CONFIG } from './config.js'
@@ -282,34 +282,96 @@ async function configureMirror({ git, cwd, userName, userEmail, helperPath }) {
  * @param {Manifest} options.manifest - files to place, relative to `manifest.dir`.
  * @returns {{ written: number, removed: number }} what the sync did.
  */
+/**
+ * Replace a working tree's contents with exactly the files a manifest describes.
+ *
+ * Uses smart incremental synchronization:
+ *  - Existing files matching the manifest in size and mtime are untouched.
+ *  - Files deleted or no longer in the manifest are removed.
+ *  - Added or modified files are copied over.
+ *
+ * @param {object} options - sync inputs.
+ * @param {string} options.work - the mirror's working directory.
+ * @param {Manifest} options.manifest - files to place, relative to `manifest.dir`.
+ * @returns {{ written: number, removed: number }} what the sync did.
+ */
 function syncWorkingTree({ work, manifest }) {
-	let removed = 0
-	for (const entry of readdirSync(work, { withFileTypes: true })) {
-		if (entry.name === '.git') continue
-		rmSync(join(work, entry.name), { recursive: true, force: true })
-		removed++
-	}
-
-	let written = 0
-	/**
-	 * @param {string} rel - `/`-separated path inside the mirror.
-	 * @param {(target: string) => void} placeFile - writes the file's bytes.
-	 */
-	const place = (rel, placeFile) => {
-		const target = join(work, ...rel.split('/'))
-		mkdirSync(dirname(target), { recursive: true })
-		placeFile(target)
-		written++
-	}
-
+	const desiredFiles = new Map()
 	for (const file of manifest.files) {
-		const source = join(manifest.dir, ...file.path.split('/'))
-		place(file.path, (target) => copyFileSync(source, target))
+		desiredFiles.set(file.path, { type: 'source', sourcePath: join(manifest.dir, ...file.path.split('/')), size: file.bytes, mtimeMs: file.mtimeMs })
 	}
-	// Generated content (a license, for instance) has no file on disk to copy.
 	for (const extra of manifest.extra ?? []) {
-		place(extra.path, (target) => writeFileSync(target, extra.content, 'utf8'))
+		desiredFiles.set(extra.path, { type: 'extra', content: extra.content })
 	}
+
+	// 1. Scan the mirror and remove stale files
+	let removed = 0
+	function cleanMirror(dir, rel = '') {
+		let entries
+		try {
+			entries = readdirSync(dir, { withFileTypes: true })
+		} catch {
+			return
+		}
+		for (const entry of entries) {
+			if (rel === '' && entry.name === '.git') continue
+			const childRel = rel === '' ? entry.name : `${rel}/${entry.name}`
+			const childAbs = join(dir, entry.name)
+			if (entry.isDirectory()) {
+				cleanMirror(childAbs, childRel)
+				// Clean empty directory
+				try {
+					if (readdirSync(childAbs).length === 0) {
+						rmSync(childAbs, { recursive: true, force: true })
+					}
+				} catch {}
+			} else if (entry.isFile()) {
+				if (!desiredFiles.has(childRel)) {
+					try {
+						rmSync(childAbs, { force: true })
+						removed++
+					} catch {}
+				}
+			}
+		}
+	}
+	cleanMirror(work, '')
+
+	// 2. Incremental copy/write of desired files
+	let written = 0
+	for (const [relPath, item] of desiredFiles.entries()) {
+		const target = join(work, ...relPath.split('/'))
+		mkdirSync(dirname(target), { recursive: true })
+
+		if (item.type === 'source') {
+			let needCopy = true
+			try {
+				const stat = statSync(target)
+				if (stat.size === item.size && Math.abs(stat.mtimeMs - item.mtimeMs) < 1000) {
+					needCopy = false
+				}
+			} catch {
+				needCopy = true
+			}
+			if (needCopy) {
+				copyFileSync(item.sourcePath, target)
+				written++
+			}
+		} else if (item.type === 'extra') {
+			let needWrite = true
+			try {
+				const existing = readFileSync(target, 'utf8')
+				if (existing === item.content) needWrite = false
+			} catch {
+				needWrite = true
+			}
+			if (needWrite) {
+				writeFileSync(target, item.content, 'utf8')
+				written++
+			}
+		}
+	}
+
 	return { written, removed }
 }
 

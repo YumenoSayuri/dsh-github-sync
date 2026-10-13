@@ -454,6 +454,13 @@ const SCANNABLE_EXTENSIONS = new Set([
 	'.css',
 	'.csv',
 	'.sql',
+	'.pem',
+	'.key',
+	'.crt',
+	'.cert',
+	'.token',
+	'.secret',
+	'.auth',
 ])
 
 /**

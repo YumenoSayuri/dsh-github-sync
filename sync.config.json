@@ -8,9 +8,7 @@
   "maxFileBytes": "",
   "_comment_6": "要发布【非 DSH】的目录（自己的项目、别的宿主的插件）目前还不支持：工作区扫描只认 DSH 插件（依据 package.json 的 dsh.bundle / dsh.client，或关键词含 dsh），这是为了不把笔记、图片堆、node_modules 一起推上去。见 README 的「待定」。",
   "workspaceRoot": "",
-  "pluginDirs": [
-    "C:\\Users\\Lenovo\\Documents\\deepseek-harness\\default-workspace\\dev-plugins"
-  ],
+  "pluginDirs": [],
   "mirrorsDir": "",
   "licensesDir": "",
   "github": {

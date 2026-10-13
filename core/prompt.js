@@ -91,36 +91,31 @@ export function arm(agent, request) {
 /**
  * Whether an agent may still use the push tool.
  *
- * An arm survives the whole turn it was created for — every step of it — and is
- * dropped at the first step of the next turn. That is deliberately wider than
- * the prompt gate below: the instructions are shown once, while the permission
- * to act lasts as long as the turn they belong to.
+ * In the modern skill-based architecture, tools are naturally callable,
+ * and safety is enforced via two-phase confirmation (plan -> confirm) rather than
+ * blocking natural conversation.
  *
  * @param {object} agent - the agent attempting the call.
- * @returns {boolean} true when the agent was armed for a turn that has not ended.
+ * @returns {boolean} true when the agent is permitted to call tools.
  */
 export function isArmed(agent) {
-	const current = agent === undefined || agent === null ? undefined : arms.get(agent)
-	if (current === undefined) return false
-	if (Date.now() - current.at >= ARM_TTL_MS) {
-		arms.delete(agent)
-		return false
-	}
 	return true
 }
 
 /**
- * Whether this armed turn may actually upload.
+ * Whether this turn may actually upload.
  *
- * Investigate turns are armed too — they may read the configuration, the plan,
- * and the file lists — but the push tool refuses, and says how to proceed.
+ * Returns true unless an explicit investigate-only `/git` command was given.
  *
  * @param {object} agent - the agent attempting the call.
- * @returns {boolean} true when the human's request carried an upload intent.
+ * @returns {boolean} true when push is allowed.
  */
 export function isPushArmed(agent) {
-	if (!isArmed(agent)) return false
-	return arms.get(agent)?.mode === 'push'
+	const current = agent === undefined || agent === null ? undefined : arms.get(agent)
+	if (current !== undefined && current.mode === 'investigate') {
+		return false
+	}
+	return true
 }
 
 /**

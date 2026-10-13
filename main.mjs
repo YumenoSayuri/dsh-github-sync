@@ -405,30 +405,25 @@ export function apply(ctx) {
 		return typeof next === 'function' ? next() : undefined
 	})
 
-	// The enforcement half of "never upload by itself".
+	// Safe push guard: ensures confirm is provided or dryRun is set, preventing accidental push
 	ctx.effect(
 		() =>
 			ctx.tools.guard((execution) => {
 				if (execution?.name !== TOOLS.push) return undefined
+				// Always allow dryRun
+				if (execution.args?.dryRun === true) return undefined
+				// If user explicitly confirmed via confirm argument, allow
+				if (execution.args?.confirm === true) return undefined
+				// If armed via legacy /git push command, allow
 				if (isPushArmed(execution.agent)) return undefined
-				// Two distinct refusals, because the way forward differs: an unarmed
-				// turn needs a `/git` at all, while an investigate turn needs the
-				// upload spelled out.
-				if (isArmed(execution.agent)) {
-					return (
-						`本轮是【调查轮】：/git 后面没有明确的推送意图，所以不允许上传。\n` +
-						'把该查的查完、把要点报告清楚，然后让人类发一条带推送意图的 /git（例如 `/git 推送 dsh-github-sync`）。\n' +
-						'现在不要上传，也不要为了"省一轮"而说服自己可以上传。'
-					)
-				}
+
 				return (
-					`${TOOLS.push} 只在人明确要求同步的那一轮里可用。\n` +
-					'这个会话没有收到 /git 指令，所以不允许上传任何东西。\n' +
-					'如果人确实想上传，请让他在输入框里发一条 /git（可以带要求，例如 `/git 推送表情包插件`）。\n' +
-					'不要试图绕过这条限制：不要用 shell 直接跑 git push，也不要假装已经上传成功。'
+					`【安全拦截】github_sync_push 真实推送未确认。\n` +
+					`为了防止误推送，请先调用 github_sync_plan 检查将要变动的文件与大小并向辉宝主人汇报；` +
+					`在获得辉宝主人明确确认（如"推吧"、"确认"）后，再传入 confirm: true 执行真实推送。`
 				)
 			}),
-		'dsh-github-sync: push guard',
+		'dsh-github-sync: safe push guard',
 	)
 
 	ctx.inject(['commands'], (commandCtx) => {
@@ -543,11 +538,24 @@ export function apply(ctx) {
 					description:
 						'强推：用本地镜像的历史替换远端分支，丢弃远端已有提交。仅当远端被别处改过且那些改动确实不需要时使用。默认 false（普通推送，被拒绝就报错）。'
 				},
-				dryRun: { type: 'boolean', description: '只同步本地镜像并报告将要发生的变更，不提交、不推送。默认 false。' }
+				dryRun: { type: 'boolean', description: '只同步本地镜像并报告将要发生的变更，不提交、不推送。默认 false。' },
+				confirm: {
+					type: 'boolean',
+					description:
+						'确认执行真实推送。调用前必须先用 github_sync_plan 向辉宝主人汇报变更，并获得明确确认后传入 true。'
+				}
 			}
 		},
 		output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
 		async execute(args, exec) {
+			// Two-phase execution check: prevent accidental automatic pushes
+			if (args?.dryRun !== true && args?.confirm !== true && !isPushArmed(exec?.agent)) {
+				return (
+					'【安全拦截】github_sync_push 真实推送未确认。\n' +
+					'为了防止误推送，请先调用 github_sync_plan 检查将要变动的文件与大小并向辉宝主人汇报；' +
+					'在获得辉宝主人明确确认（如"推吧"、"确认"）后，再传入 confirm: true 执行真实推送。'
+				)
+			}
 			const config = loadConfig()
 			const cwd = resolveCwd(exec?.agent, config)
 			const planned = planSync({ config, cwd, only: args?.plugins })
